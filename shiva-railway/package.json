@@ -1,0 +1,11 @@
+{
+  "name": "shiva-trading-bot",
+  "version": "1.0.0",
+  "description": "SHIVA Live Trading Bot - 40 NVIDIA Agents on Vercel",
+  "dependencies": {
+    "metaapi.cloud-sdk": "latest"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
