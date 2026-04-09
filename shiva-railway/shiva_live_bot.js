@@ -11,16 +11,26 @@ const fs = require('fs');
 // ============ CONFIG ============
 const TOKEN = process.env.METAAPI_TOKEN || '';
 const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID || '';
-const SYMBOL = 'SpotCrude';
-const LOT_SIZE = 0.03;
-const POSITIONS = 6;
-const ENTRY_GAP_MS = 3000;
-const STOP_LOSS = 0.10; // Tight SL - bot managed
-const TRAIL_START = 0.30;
-const TRAIL_DISTANCE = 0.15;
+const SYMBOL = process.env.SYMBOL || 'XTIUSD';
+const LOT_SIZE = 0.01; // Minimum lot size (ultra-safe for small accounts)
+const POSITIONS = 2; // Will be auto-adjusted based on balance
+const ENTRY_GAP_MS = 5000;
+const STOP_LOSS = 1.50; // Stop loss in dollars for XTIUSD
+const TRAIL_START = 0.50; // Trail winners when profit > $0.50
+const TRAIL_DISTANCE = 0.25;
 const CHECK_INTERVAL = 30000;
-const MAX_TRADES_PER_CYCLE = 6;
-const ML_RETRAIN_INTERVAL = 5; // Retrain ML every 5 cycles
+const MAX_TRADES_PER_CYCLE = 6; // Will be auto-adjusted based on balance
+const ML_RETRAIN_INTERVAL = 5;
+const MAX_DRAWDOWN_PCT = 20;
+const RISK_PER_TRADE_PCT = 2;
+const MIN_BALANCE_THRESHOLD = 3.00;
+
+// Dynamic position sizing based on balance
+function getDynamicPositions(balance) {
+  if (balance >= 100) return 6; // $100+ = 6 positions
+  if (balance >= 50) return 4;  // $50-99 = 4 positions
+  return 2; // Below $50 = 2 positions (ultra-safe)
+}
 
 // ============ STATE ============
 let api, connection, tradingAccount;
@@ -511,6 +521,30 @@ function printDashboard(equity, price, consensus, pnl, indicators, positions) {
 
 // ============ TRADE MANAGEMENT ============
 async function openPosition(signal, price, posNum) {
+  // Check balance threshold before opening
+  try {
+    const accountInfo = await connection.getAccountInformation();
+    
+    // Stop if balance too low
+    if (accountInfo.balance < MIN_BALANCE_THRESHOLD) {
+      console.log(`🛑 BALANCE TOO LOW: $${accountInfo.balance.toFixed(2)} < $${MIN_BALANCE_THRESHOLD.toFixed(2)}`);
+      console.log(`⏸️ Trading stopped. Please deposit more funds.`);
+      return null;
+    }
+    
+    // Check drawdown
+    if (initialEquity > 0) {
+      const drawdownPct = ((initialEquity - accountInfo.equity) / initialEquity) * 100;
+      if (drawdownPct > MAX_DRAWDOWN_PCT) {
+        console.log(`🛑 DRAWDOWN LIMIT REACHED: ${drawdownPct.toFixed(2)}% > ${MAX_DRAWDOWN_PCT}%`);
+        console.log(`⏸️ Trading paused. Account needs recovery.`);
+        return null;
+      }
+    }
+  } catch (e) {
+    console.log(`⚠ Could not check drawdown: ${e.message}`);
+  }
+
   // Calculate spread
   const priceData = await connection.getSymbolPrice(SYMBOL);
   const bid = priceData.bid || price;
@@ -518,10 +552,9 @@ async function openPosition(signal, price, posNum) {
   const spread = ask - bid;
   const spreadPips = spread;
 
-  // TIGHT SL: Bot calculates based on spread + small buffer
-  // Tight SL = 0.10 (tight) + 2x spread buffer
-  const baseSL = 0.10; // Tight SL
-  const spreadBuffer = spreadPips * 1.5; // 1.5x spread buffer
+  // TIGHT SL: Ultra-conservative for $5.69 account
+  const baseSL = STOP_LOSS; // 0.05 for micro account
+  const spreadBuffer = spreadPips * 1.5;
   const totalSL = baseSL + spreadBuffer;
 
   const sl = signal === 'BUY' ? (price - totalSL).toFixed(3) : (price + totalSL).toFixed(3);
@@ -532,6 +565,7 @@ async function openPosition(signal, price, posNum) {
   console.log(`📊 Spread: ${(spread * 100).toFixed(1)} cents | Tight SL: ${(totalSL * 100).toFixed(1)} cents`);
   console.log(`🛑 SL: ${sl}`);
   console.log(`🎯 ENTRY: ${price.toFixed(3)} | 🛑 SL: ${sl} | 📈 TP: ${tp_display} | 📋 ${signal} | #${posNum}`);
+  console.log(`💰 Risk: ~$${(totalSL * LOT_SIZE * 100).toFixed(2)} (${RISK_PER_TRADE_PCT}% of $100)`);
 
   try {
     const result = signal === 'BUY'
@@ -584,13 +618,13 @@ async function managePositions(currentPrice) {
         managed.highestPnl = profit;
       }
 
-      // CUT LOSERS: Close if loss > $0.50
-      if (profit < -0.50) {
+      // CUT LOSERS: Close if loss > $0.15 (ultra-tight for $5.69 account)
+      if (profit < -0.15) {
         console.log(`\n🔴 CUTTING LOSER | ${managed.id.slice(0,8)} | PnL: $${profit.toFixed(2)}`);
         try {
           await tradingAccount.closePosition(pos.id);
           console.log(`✅ Loser closed`);
-          logTrade(managed.type, managed.entry, currentPrice, profit, indicators, 'cut_loss');
+          logTrade(managed.type, managed.entry, currentPrice, profit, [], 'cut_loss');
           postToDiscordOnTradeClose(managed.type, profit, 'cut_loss');
           losses++;
           managedPositions = managedPositions.filter(m => m.id !== managed.id);
@@ -654,6 +688,7 @@ async function runCycle() {
     const price = priceData.bid || priceData.ask;
     const info = await connection.getAccountInformation();
     const equity = info.equity || 0;
+    const balance = info.balance || equity;
     const pnl = equity - initialEquity;
 
     // Build synthetic candles
@@ -712,6 +747,9 @@ async function runCycle() {
       console.log(`🤖 ML: ${mlPrediction.signal} | Confidence: ${(mlPrediction.confidence*100).toFixed(0)}% | ${mlPrediction.agrees ? '✅ Agrees' : '⚠️ Disagrees'}`);
     }
 
+    // Get dynamic position count based on balance
+    const dynamicPositions = getDynamicPositions(balance);
+    
     // Manage existing positions (every 30s)
     if (timeSinceLastCheck >= CHECK_INTERVAL) {
       lastCheck = now;
@@ -733,11 +771,12 @@ async function runCycle() {
       console.log(`⚠ Position check failed: ${e.message}`);
     }
 
-    const needToOpen = Math.max(0, POSITIONS - myOpen.length);
+    const needToOpen = Math.max(0, dynamicPositions - myOpen.length);
 
     if (needToOpen > 0 && canTrade && (finalSignal === 'BUY' || finalSignal === 'SELL')) {
       console.log(`\n🚀 Opening ${needToOpen} positions (${finalSignal} ${finalStrength}%)${mlNote}`);
-      console.log(`📋 Existing: ${myOpen.length} | New: ${needToOpen} | Target: ${POSITIONS}`);
+      console.log(`💰 Balance: $${balance.toFixed(2)} | Dynamic Positions: ${dynamicPositions}/6`);
+      console.log(`📋 Existing: ${myOpen.length} | New: ${needToOpen} | Target: ${dynamicPositions}`);
 
       for (let i = 0; i < needToOpen; i++) {
         await openPosition(finalSignal, price, myOpen.length + i + 1);
@@ -746,8 +785,8 @@ async function runCycle() {
           await new Promise(r => setTimeout(r, ENTRY_GAP_MS));
         }
       }
-    } else if (myOpen.length >= POSITIONS) {
-      console.log(`\n📋 ${myOpen.length}/${POSITIONS} positions full. Managing...`);
+    } else if (myOpen.length >= dynamicPositions) {
+      console.log(`\n📋 ${myOpen.length}/${dynamicPositions} positions full. Managing...`);
     } else {
       console.log(`\n⏸ Waiting: ${finalSignal} ${finalStrength}% (need >= 50%)${mlNote}`);
     }
@@ -758,7 +797,7 @@ async function runCycle() {
       const finalPositions = await connection.getPositions();
       myFinal = finalPositions.filter(p => p.symbol === SYMBOL);
     } catch (e) {}
-    console.log(`\n📊 Open: ${myFinal.length}/${POSITIONS} | Trailing winners | Cutting losers`);
+    console.log(`\n📊 Open: ${myFinal.length}/${dynamicPositions} | Trailing winners | Cutting losers`);
     console.log(`⏳ Next check in ${CHECK_INTERVAL/1000}s...`);
 
   } catch (e) {
@@ -769,9 +808,12 @@ async function runCycle() {
 // ============ START ============
 async function main() {
   try {
-    await connectMT4();
-    console.log(`\n🚀 LIVE TRADING - 6 Positions | Trail Winners | Cut Losers`);
+    const accountInfo = await connectMT4();
+    const startingPositions = getDynamicPositions(accountInfo.balance);
+    console.log(`\n🚀 LIVE TRADING - Dynamic Positions (2→6 based on balance)`);
+    console.log(`💰 Current: $${accountInfo.balance.toFixed(2)} | Positions: ${startingPositions}/6`);
     console.log(`📋 Check every ${CHECK_INTERVAL/1000}s | Gap: ${ENTRY_GAP_MS/1000}s`);
+    console.log(`📈 Auto-scale: <$50=2 pos | $50-99=4 pos | $100+=6 pos`);
 
     // Run first cycle immediately
     await runCycle();
