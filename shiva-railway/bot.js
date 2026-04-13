@@ -23,11 +23,14 @@ const TOKEN = process.env.METAAPI_TOKEN || '';
 const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID || '';
 const SYMBOL = process.env.SYMBOL || 'XTIUSD';
 const LOT_SIZE = parseFloat(process.env.LOT_SIZE) || 0.01;
-const MAX_POSITIONS = parseInt(process.env.POSITIONS) || 4;
+const MAX_POSITIONS = parseInt(process.env.POSITIONS) || 1;
 const STOP_LOSS = parseFloat(process.env.STOP_LOSS) || 1.39;
 const TRAIL_START = parseFloat(process.env.TRAIL_START) || 0.50;
 const TRAIL_DISTANCE = 0.30;
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 30000; // 30s
+const MIN_CONFIDENCE = parseInt(process.env.MIN_CONFIDENCE) || 50;    // Min % to open trade
+const MAX_DAILY_LOSS = parseFloat(process.env.MAX_DAILY_LOSS) || 3.00; // Max $ loss per day
+const WICK_LOOKBACK = 3;  // Last N candles for wick SL
 
 // In-memory state
 let api, tradingAccount;
@@ -36,6 +39,9 @@ let breakevenSet = {};  // Track positions moved to breakeven
 let tradeHistory = [];
 let mlModel = {};
 let cycleCount = 0;
+let dailyPnl = 0;       // Track daily PnL
+let dailyLossLimit = false;
+let startingBalance = 0;
 
 // ============ HELPERS ============
 function log(msg, type = 'info') {
@@ -446,29 +452,27 @@ async function openPosition(signal, price, posNum, indicators = [], candles = []
   const spread = (priceData.ask || price) - (priceData.bid || price);
   const spreadPct = ((spread / price) * 100).toFixed(3);
 
-  // WICK-BASED SL: find last swing wick from recent candles
+  // WICK-BASED SL: use last candle's wick (tightest possible)
   let wickSL = null;
-  const lookback = Math.min(candles.length, 10);
-  if (lookback >= 3 && candles.length > 0) {
-    const recentCandles = candles.slice(-lookback);
+  const lookback = Math.min(candles.length, WICK_LOOKBACK);
+  if (lookback >= 1 && candles.length > 0) {
+    const lastCandle = candles[candles.length - 1];
     if (signal === 'BUY') {
-      const swingLow = Math.min(...recentCandles.map(c => c.low));
-      wickSL = price - swingLow;  // distance from price to swing low
+      wickSL = price - lastCandle.low;  // distance from price to last candle low
     } else {
-      const swingHigh = Math.max(...recentCandles.map(c => c.high));
-      wickSL = swingHigh - price;  // distance from swing high to price
+      wickSL = lastCandle.high - price;  // distance from last candle high to price
     }
   }
 
-  // Use wick SL if valid, otherwise fall back to configured STOP_LOSS
+  // Use wick SL if tight enough, otherwise fall back to configured STOP_LOSS
   let slDistance;
-  if (wickSL && wickSL > 0 && wickSL <= STOP_LOSS) {
+  if (wickSL && wickSL > 0.05 && wickSL <= STOP_LOSS) {
     slDistance = wickSL + spread;  // SL just past the wick (+ spread buffer)
-    log(`📏 Wick-based SL: $${wickSL.toFixed(3)} (swing ${signal === 'BUY' ? 'low' : 'high'})`);
+    log(`📏 Wick SL: $${wickSL.toFixed(3)} (last candle ${signal === 'BUY' ? 'low' : 'high'})`);
   } else {
     slDistance = STOP_LOSS + (spread * 2);
     if (wickSL && wickSL > STOP_LOSS) {
-      log(`⚠️ Wick SL $${wickSL.toFixed(3)} exceeds max $${STOP_LOSS}, using capped SL`);
+      log(`⚠️ Wick SL $${wickSL.toFixed(3)} > max $${STOP_LOSS}, using capped SL`);
     }
   }
 
@@ -592,7 +596,20 @@ async function tradingCycle() {
     const balance = info.balance || 0;
     const pnl = equity - balance;
 
-    log(`Cycle #${cycleCount} | Equity: $${equity.toFixed(2)} | Balance: $${balance.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+    // Track starting balance
+    if (startingBalance === 0 && balance > 0) startingBalance = balance;
+
+    // Track daily PnL
+    dailyPnl = balance - startingBalance;
+
+    // Daily loss limit check
+    if (dailyLossLimit || dailyPnl <= -MAX_DAILY_LOSS) {
+      dailyLossLimit = true;
+      log(`🛑 Daily loss limit reached: $${dailyPnl.toFixed(2)} / -$${MAX_DAILY_LOSS.toFixed(2)}. Stopping trades.`, 'error');
+      return;
+    }
+
+    log(`Cycle #${cycleCount} | Equity: $${equity.toFixed(2)} | Balance: $${balance.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Daily: ${dailyPnl >= 0 ? '+' : ''}$${dailyPnl.toFixed(2)}`);
 
     const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
     const price = priceData.bid || priceData.ask;
@@ -693,10 +710,9 @@ async function tradingCycle() {
     const activeCount = checkPositions.filter(p => p.symbol === SYMBOL).length;
     
     if (finalSignal !== 'HOLD' && activeCount < MAX_POSITIONS) {
-      const maxPerCycle = 2;
-      const toOpen = Math.min(MAX_POSITIONS - activeCount, maxPerCycle);
-      if (toOpen > 0 && finalConfidence >= 40) {
-        log(`Opening ${toOpen} ${finalSignal}(s) | Confidence: ${finalConfidence}% | ${activeCount}/${MAX_POSITIONS}`);
+      const toOpen = Math.min(MAX_POSITIONS - activeCount, 1);
+      if (toOpen > 0 && finalConfidence >= MIN_CONFIDENCE) {
+        log(`Opening ${toOpen} ${finalSignal}(s) | Confidence: ${finalConfidence}% (min: ${MIN_CONFIDENCE}%) | ${activeCount}/${MAX_POSITIONS}`);
         for (let i = 0; i < toOpen; i++) {
           await openPosition(finalSignal, price, i + 1, indicators, candles);
           await new Promise(r => setTimeout(r, 3000));
