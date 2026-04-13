@@ -37,9 +37,10 @@ const WICK_LOOKBACK = 3;  // Last N candles for wick SL
 // Dynamic lot size calculation
 function calcLotSize(balance, slDistance, riskPct = RISK_PCT) {
   const riskAmount = balance * riskPct;  // 1% of balance
-  // For USOIL: 1 lot = $1 per pip, so lots = riskAmount / slDistance
+  // For USOIL on Axiory: 0.01 lot = $0.01 per $1 move
+  // lots = riskAmount / slDistance
   let lots = riskAmount / slDistance;
-  lots = Math.max(0.01, Math.min(lots, 0.10));  // Clamp between 0.01 and 0.10
+  lots = Math.max(0.01, Math.min(lots, 0.01));  // Fixed at 0.01 for small accounts
   return Math.round(lots * 100) / 100;  // Round to 2 decimals
 }
 
