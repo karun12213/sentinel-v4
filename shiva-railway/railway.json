@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "sleep infinity",
+    "startCommand": "node bot.js",
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 5
   }
