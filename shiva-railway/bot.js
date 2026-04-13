@@ -24,8 +24,9 @@ const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID || '';
 const SYMBOL = process.env.SYMBOL || 'XTIUSD';
 const LOT_SIZE = parseFloat(process.env.LOT_SIZE) || 0.01;
 const MAX_POSITIONS = parseInt(process.env.POSITIONS) || 1;
-const STOP_LOSS = parseFloat(process.env.STOP_LOSS) || 1.39;
-const TRAIL_START = parseFloat(process.env.TRAIL_START) || 0.50;
+const STOP_LOSS = 3.00;  // Max SL cap
+const BREAKEVEN_AT = parseFloat(process.env.BREAKEVEN_AT) || 1.50;  // Move to BE at this profit
+const TRAIL_START = 1.50;
 const TRAIL_DISTANCE = 0.30;
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 30000; // 30s
 const MIN_CONFIDENCE = parseInt(process.env.MIN_CONFIDENCE) || 50;    // Min % to open trade
@@ -452,50 +453,45 @@ async function openPosition(signal, price, posNum, indicators = [], candles = []
   const spread = (priceData.ask || price) - (priceData.bid || price);
   const spreadPct = ((spread / price) * 100).toFixed(3);
 
-  // WICK-BASED SL: use last candle's wick (tightest possible)
-  let wickSL = null;
+  // WICK-BASED SL: use wick bottom/top from recent candles (tightest possible)
+  let wickDistance = null;
   const lookback = Math.min(candles.length, WICK_LOOKBACK);
   if (lookback >= 1 && candles.length > 0) {
-    const lastCandle = candles[candles.length - 1];
+    const recentCandles = candles.slice(-lookback);
     if (signal === 'BUY') {
-      wickSL = price - lastCandle.low;  // distance from price to last candle low
+      const wickLow = Math.min(...recentCandles.map(c => c.low));
+      wickDistance = price - wickLow;  // distance from price to wick bottom
     } else {
-      wickSL = lastCandle.high - price;  // distance from last candle high to price
+      const wickHigh = Math.max(...recentCandles.map(c => c.high));
+      wickDistance = wickHigh - price;  // distance from wick top to price
     }
   }
 
-  // Use wick SL if tight enough, otherwise fall back to configured STOP_LOSS
+  // Use wick distance as SL, capped at $3.00 max
   let slDistance;
-  if (wickSL && wickSL > 0.05 && wickSL <= STOP_LOSS) {
-    slDistance = wickSL + spread;  // SL just past the wick (+ spread buffer)
-    log(`📏 Wick SL: $${wickSL.toFixed(3)} (last candle ${signal === 'BUY' ? 'low' : 'high'})`);
+  const MAX_SL = STOP_LOSS;  // $3.00 cap
+  const MIN_SL = 0.10;  // Minimum SL to avoid noise stop-outs
+
+  if (wickDistance && wickDistance > 0) {
+    // Add spread buffer to wick SL
+    slDistance = wickDistance + spread;
+    log(`📏 Wick SL: $${wickDistance.toFixed(3)} (last ${lookback} candles ${signal === 'BUY' ? 'low' : 'high'})`);
   } else {
-    slDistance = STOP_LOSS + (spread * 2);
-    if (wickSL && wickSL > STOP_LOSS) {
-      log(`⚠️ Wick SL $${wickSL.toFixed(3)} > max $${STOP_LOSS}, using capped SL`);
-    }
+    slDistance = MAX_SL;
   }
 
-  // Cap SL at configured max
-  const cappedSL = Math.min(slDistance, STOP_LOSS + spread * 2);
+  // Enforce min/max bounds
+  slDistance = Math.max(MIN_SL, Math.min(slDistance, MAX_SL));
 
-  // SPREAD CHECK: reject if spread exceeds $3.00
-  const maxSpread = 3.00;
-  if (spread > maxSpread) {
-    log(`⚠️ Spread too wide: $${spread.toFixed(3)} > max $${maxSpread.toFixed(2)} — SKIPPED`, 'error');
-    return { success: false, error: `Spread too wide: $${spread.toFixed(3)}` };
+  // SPREAD CHECK: reject if spread eats more than 50% of SL
+  if (spread > slDistance * 0.50) {
+    log(`⚠️ Spread $${spread.toFixed(3)} too wide for SL $${slDistance.toFixed(2)} — SKIPPED`, 'error');
+    return { success: false, error: `Spread too wide` };
   }
 
-  // Total effective loss must not exceed $3.00
-  const effectiveLoss = cappedSL + spread;
-  if (effectiveLoss > 3.00) {
-    log(`⚠️ Effective loss $${effectiveLoss.toFixed(2)} exceeds $3.00 max — SKIPPED`, 'error');
-    return { success: false, error: `Effective loss exceeds $3.00 max` };
-  }
+  const sl = signal === 'BUY' ? (price - slDistance).toFixed(2) : (price + slDistance).toFixed(2);
 
-  const sl = signal === 'BUY' ? (price - cappedSL).toFixed(2) : (price + cappedSL).toFixed(2);
-
-  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | Spread: $${spread.toFixed(3)} (${spreadPct}%) | SL: ${sl}`);
+  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | Spread: $${spread.toFixed(3)} (${spreadPct}%) | SL: ${sl} (distance: $${slDistance.toFixed(2)})`);
 
   try {
     const result = signal === 'BUY'
@@ -525,8 +521,10 @@ async function managePositions(currentPrice) {
       // Update peak in memory
       if (profit > peak) peakPnl[posKey] = profit;
 
-      // CUT LOSERS - tight for small account
-      if (profit < -STOP_LOSS) {
+      // CUT LOSERS - use dynamic SL (wick-based, max $3.00)
+      const entryPrice = pos.openPrice || currentPrice;
+      const dynamicSL = STOP_LOSS;  // Max $3.00 SL
+      if (profit < -dynamicSL) {
         log(`🔴 CUTTING LOSER | ${posKey.slice(0,8)} | PnL: $${profit.toFixed(2)}`, 'error');
         await tradingAccount.closePosition(posKey);
         logTrade(pos.type, pos.openPrice || 0, currentPrice, profit, [], 'cut_loss');
@@ -535,19 +533,11 @@ async function managePositions(currentPrice) {
         continue;
       }
 
-      // MOVE TO BREAKEVEN: when profit >= $0.50, tighten SL to entry
-      if (!breakevenSet[posKey] && profit >= 0.50) {
+      // MOVE TO BREAKEVEN: when profit >= BREAKEVEN_AT, tighten SL to entry
+      if (!breakevenSet[posKey] && profit >= BREAKEVEN_AT) {
         try {
-          const entryPrice = pos.openPrice || currentPrice;
-          const p = await tradingAccount.getSymbolPrice(SYMBOL);
-          const spread = (p.ask - p.bid) || 0.03;
-          const newSL = pos.type === 'POSITION_TYPE_BUY'
-            ? parseFloat((entryPrice + spread).toFixed(2))
-            : parseFloat((entryPrice - spread).toFixed(2));
-
           await tradingAccount.closePosition(posKey);
-          // Re-open at breakeven (close and re-open is safest with MetaApi)
-          log(`🟡 BREAKEVEN | ${posKey.slice(0,8)} | Moved SL to entry $${entryPrice.toFixed(2)} (position closed at $${profit.toFixed(2)})`, 'success');
+          log(`🟡 BREAKEVEN | ${posKey.slice(0,8)} | Moved SL to entry $${entryPrice.toFixed(2)} (closed at $${profit.toFixed(2)})`, 'success');
           logTrade(pos.type, pos.openPrice || 0, currentPrice, profit, [], 'breakeven_close');
           delete peakPnl[posKey];
           delete breakevenSet[posKey];
@@ -753,7 +743,8 @@ async function tradingCycle() {
 // ============ MAIN ============
 async function main() {
   log('🔱 SHIVA GODMODE OVERLORD — Railway 24/7');
-  log(`📊 Symbol: ${SYMBOL} | Lot: ${LOT_SIZE} | Max: ${MAX_POSITIONS} | SL: $${STOP_LOSS} | TP: $3.00`);
+  log(`📊 Symbol: ${SYMBOL} | Lot: ${LOT_SIZE} | Max: ${MAX_POSITIONS}`);
+  log(`📏 SL: Wick-based (max $${STOP_LOSS}) | BE: +$${BREAKEVEN_AT} | TP: $3.00`);
   log(`⏱️  Check interval: ${CHECK_INTERVAL / 1000}s`);
 
   // Test Redis connection
