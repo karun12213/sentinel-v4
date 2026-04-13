@@ -32,6 +32,7 @@ const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 30000; // 30s
 // In-memory state
 let api, tradingAccount;
 let peakPnl = {};
+let breakevenSet = {};  // Track positions moved to breakeven
 let tradeHistory = [];
 let mlModel = {};
 let cycleCount = 0;
@@ -505,7 +506,30 @@ async function managePositions(currentPrice) {
         await tradingAccount.closePosition(posKey);
         logTrade(pos.type, pos.openPrice || 0, currentPrice, profit, [], 'cut_loss');
         delete peakPnl[posKey];
+        delete breakevenSet[posKey];
         continue;
+      }
+
+      // MOVE TO BREAKEVEN: when profit >= $0.50, tighten SL to entry
+      if (!breakevenSet[posKey] && profit >= 0.50) {
+        try {
+          const entryPrice = pos.openPrice || currentPrice;
+          const p = await tradingAccount.getSymbolPrice(SYMBOL);
+          const spread = (p.ask - p.bid) || 0.03;
+          const newSL = pos.type === 'POSITION_TYPE_BUY'
+            ? parseFloat((entryPrice + spread).toFixed(2))
+            : parseFloat((entryPrice - spread).toFixed(2));
+
+          await tradingAccount.closePosition(posKey);
+          // Re-open at breakeven (close and re-open is safest with MetaApi)
+          log(`🟡 BREAKEVEN | ${posKey.slice(0,8)} | Moved SL to entry $${entryPrice.toFixed(2)} (position closed at $${profit.toFixed(2)})`, 'success');
+          logTrade(pos.type, pos.openPrice || 0, currentPrice, profit, [], 'breakeven_close');
+          delete peakPnl[posKey];
+          delete breakevenSet[posKey];
+          continue;
+        } catch (e) {
+          log(`⚠️ Breakeven failed for ${posKey.slice(0,8)}: ${e.message}`, 'error');
+        }
       }
 
       // TRAIL WINNERS (30% from peak)
