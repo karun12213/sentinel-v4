@@ -695,6 +695,27 @@ async function tradingCycle() {
       await redis.set('shiva:account_info', { equity, balance, pnl });
       await redis.set('shiva:last_run', { time: new Date().toISOString(), cycle: cycleCount });
       await redis.set('shiva:trades', tradeHistory.slice(-200));
+
+      // Push agent messages for Vercel dashboard
+      const agentMessages = indicators.map((a, i) => ({
+        id: i + 1,
+        emoji: a.e || '',
+        name: a.n || '',
+        signal: a.s || 'HOLD'
+      }));
+      await redis.set('shiva:agent_messages', {
+        cycle: cycleCount,
+        time: new Date().toISOString(),
+        ict: { signal: ict.signal, confidence: ict.confidence, phase: ict.po3Phase, ifvgs: ict.ifvgLevels.length },
+        consensus: { signal: consensus.signal, buy: consensus.buy, sell: consensus.sell, hold: consensus.hold, pct: consensus.pct },
+        ml: { signal: ml.signal, confidence: ml.confidence, note: ml.mlNote },
+        news: { recommendation: newsFilter.recommendation, sentiment: newsFilter.news?.sentiment || 0, count: newsFilter.news?.count || 0 },
+        final: { signal: finalSignal, confidence: finalConfidence },
+        agents: agentMessages,
+        price: price.toFixed(2),
+        spread: spread.toFixed(3)
+      });
+
       await redis.rpush('shiva:bot_logs', {
         timestamp: new Date().toISOString(), type: 'info', icon: '📊',
         message: `Cycle #${cycleCount} | Equity: $${equity.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Positions: ${activePositions.length}`
