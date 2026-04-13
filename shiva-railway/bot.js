@@ -445,11 +445,18 @@ async function openPosition(signal, price, posNum, indicators = []) {
   const spread = (priceData.ask || price) - (priceData.bid || price);
   const spreadPct = ((spread / price) * 100).toFixed(3);
 
-  // SPREAD CHECK: reject if spread eats more than 30% of SL
-  const maxSpread = STOP_LOSS * 0.30;
+  // SPREAD CHECK: reject if spread exceeds $3.00
+  const maxSpread = 3.00;
   if (spread > maxSpread) {
-    log(`⚠️ Spread too wide: $${spread.toFixed(3)} (${spreadPct}%) > max $${maxSpread.toFixed(2)} — SKIPPED`, 'error');
+    log(`⚠️ Spread too wide: $${spread.toFixed(3)} > max $${maxSpread.toFixed(2)} — SKIPPED`, 'error');
     return { success: false, error: `Spread too wide: $${spread.toFixed(3)}` };
+  }
+
+  // Total effective loss (SL + spread cost) must not exceed $3.00
+  const effectiveLoss = STOP_LOSS + (spread * 2);
+  if (effectiveLoss > 3.00) {
+    log(`⚠️ Effective loss $${effectiveLoss.toFixed(2)} exceeds $3.00 max (SL: $${STOP_LOSS} + spread cost: $${(spread * 2).toFixed(3)}) — SKIPPED`, 'error');
+    return { success: false, error: `Effective loss exceeds $3.00 max` };
   }
 
   // SL must be at least 2x spread to avoid instant stop-outs
@@ -548,8 +555,8 @@ async function tradingCycle() {
     const spreadPct = ((spread / price) * 100).toFixed(3);
 
     // Log spread health check
-    const spreadOk = spread <= STOP_LOSS * 0.30;
-    log(`Spread: $${spread.toFixed(3)} (${spreadPct}%) ${spreadOk ? '✅ OK' : '⚠️ WIDE'}`);
+    const spreadOk = spread <= 3.00 && (STOP_LOSS + spread * 2) <= 3.00;
+    log(`Spread: $${spread.toFixed(3)} (${spreadPct}%) | Effective loss: $${(STOP_LOSS + spread * 2).toFixed(2)} ${spreadOk ? '✅ OK' : '⚠️ WIDE'}`);
 
     // Build candles from real spread
     const candles = [];
