@@ -604,6 +604,7 @@ async function tradingCycle() {
       await redis.set('shiva:positions', positionData);
       await redis.set('shiva:account_info', { equity, balance, pnl });
       await redis.set('shiva:last_run', { time: new Date().toISOString(), cycle: cycleCount });
+      await redis.set('shiva:trades', tradeHistory.slice(-200));
       await redis.rpush('shiva:bot_logs', {
         timestamp: new Date().toISOString(), type: 'info', icon: '📊',
         message: `Cycle #${cycleCount} | Equity: $${equity.toFixed(2)} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Positions: ${activePositions.length}`
