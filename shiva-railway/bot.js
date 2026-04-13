@@ -443,10 +443,26 @@ function mlPredict(consensus) {
 async function openPosition(signal, price, posNum, indicators = []) {
   const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
   const spread = (priceData.ask || price) - (priceData.bid || price);
+  const spreadPct = ((spread / price) * 100).toFixed(3);
+
+  // SPREAD CHECK: reject if spread eats more than 30% of SL
+  const maxSpread = STOP_LOSS * 0.30;
+  if (spread > maxSpread) {
+    log(`⚠️ Spread too wide: $${spread.toFixed(3)} (${spreadPct}%) > max $${maxSpread.toFixed(2)} — SKIPPED`, 'error');
+    return { success: false, error: `Spread too wide: $${spread.toFixed(3)}` };
+  }
+
+  // SL must be at least 2x spread to avoid instant stop-outs
+  const minSL = spread * 2;
+  if (STOP_LOSS < minSL) {
+    log(`⚠️ SL $${STOP_LOSS.toFixed(2)} too tight for spread $${spread.toFixed(3)} (need >= $${minSL.toFixed(2)}) — SKIPPED`, 'error');
+    return { success: false, error: `SL too tight for spread` };
+  }
+
   const totalSL = STOP_LOSS + (spread * 2);
   const sl = signal === 'BUY' ? (price - totalSL).toFixed(2) : (price + totalSL).toFixed(2);
 
-  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | SL: ${sl}`);
+  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | Spread: $${spread.toFixed(3)} (${spreadPct}%) | SL: ${sl}`);
 
   try {
     const result = signal === 'BUY'
@@ -528,10 +544,15 @@ async function tradingCycle() {
 
     const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
     const price = priceData.bid || priceData.ask;
+    const spread = (priceData.ask - priceData.bid) || 0.05;
+    const spreadPct = ((spread / price) * 100).toFixed(3);
+
+    // Log spread health check
+    const spreadOk = spread <= STOP_LOSS * 0.30;
+    log(`Spread: $${spread.toFixed(3)} (${spreadPct}%) ${spreadOk ? '✅ OK' : '⚠️ WIDE'}`);
 
     // Build candles from real spread
     const candles = [];
-    const spread = (priceData.ask - priceData.bid) || 0.05;
     const volatility = spread * (3 + Math.random() * 2);
     for (let i = 0; i < 50; i++) {
       const trend = Math.sin(i / 10) * volatility * 2;
