@@ -536,7 +536,7 @@ async function managePositions(currentPrice) {
 
       // CUT LOSERS - use dynamic SL (wick-based, max $3.00)
       const entryPrice = pos.openPrice || currentPrice;
-      const dynamicSL = STOP_LOSS;  // Max $3.00 SL
+      const dynamicSL = MAX_SL;  // Max $3.00 SL
       if (profit < -dynamicSL) {
         log(`🔴 CUTTING LOSER | ${posKey.slice(0,8)} | PnL: $${profit.toFixed(2)}`, 'error');
         await tradingAccount.closePosition(posKey);
