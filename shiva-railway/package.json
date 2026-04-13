@@ -1,9 +1,10 @@
 {
   "name": "shiva-trading-bot",
   "version": "1.0.0",
-  "description": "SHIVA Live Trading Bot - 40 NVIDIA Agents on Vercel",
+  "description": "SHIVA Live Trading Bot - 40 NVIDIA Agents with ICT + ML",
   "dependencies": {
-    "metaapi.cloud-sdk": "latest"
+    "metaapi.cloud-sdk": "latest",
+    "@upstash/redis": "latest"
   },
   "engines": {
     "node": ">=18.0.0"

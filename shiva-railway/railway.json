@@ -4,8 +4,8 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "bash start_railway.sh",
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 3
+    "startCommand": "node bot.js",
+    "restartPolicyType": "ALWAYS",
+    "restartPolicyMaxRetries": 5
   }
 }
