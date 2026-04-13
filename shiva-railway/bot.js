@@ -18,20 +18,30 @@ const redis = new Redis({
   token: 'gQAAAAAAATn-AAIncDJlNjdjM2M4OTQzOTg0OGRhYjE3MzRjNjNhM2U1ZDUzNnAyODAzODI',
 });
 
-// Config
+// Config — HFT Style: 1% risk, 1:3 RR, fast cycles
 const TOKEN = process.env.METAAPI_TOKEN || '';
 const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID || '';
 const SYMBOL = process.env.SYMBOL || 'XTIUSD';
-const LOT_SIZE = parseFloat(process.env.LOT_SIZE) || 0.01;
+const RISK_PCT = parseFloat(process.env.RISK_PCT) || 0.01;  // 1% risk per trade
+const RR_RATIO = parseFloat(process.env.RR_RATIO) || 3.0;   // 1:3 risk-to-reward
 const MAX_POSITIONS = parseInt(process.env.POSITIONS) || 1;
-const STOP_LOSS = 3.00;  // Max SL cap
-const BREAKEVEN_AT = parseFloat(process.env.BREAKEVEN_AT) || 1.50;  // Move to BE at this profit
-const TRAIL_START = 1.50;
-const TRAIL_DISTANCE = 0.30;
-const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 30000; // 30s
-const MIN_CONFIDENCE = parseInt(process.env.MIN_CONFIDENCE) || 50;    // Min % to open trade
-const MAX_DAILY_LOSS = parseFloat(process.env.MAX_DAILY_LOSS) || 3.00; // Max $ loss per day
+const MAX_SL = 3.00;  // Absolute max SL cap
+const MIN_SL = 0.10;  // Min SL to avoid noise
+const BREAKEVEN_AT = parseFloat(process.env.BREAKEVEN_AT) || 1.00;  // Move to BE at this profit
+const TRAIL_START = 1.00;
+const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 5000;  // 5s HFT cycle
+const MIN_CONFIDENCE = parseInt(process.env.MIN_CONFIDENCE) || 45;    // Lower threshold for more trades
+const MAX_DAILY_LOSS = parseFloat(process.env.MAX_DAILY_LOSS) || 5.00; // Max $ loss per day
 const WICK_LOOKBACK = 3;  // Last N candles for wick SL
+
+// Dynamic lot size calculation
+function calcLotSize(balance, slDistance, riskPct = RISK_PCT) {
+  const riskAmount = balance * riskPct;  // 1% of balance
+  // For USOIL: 1 lot = $1 per pip, so lots = riskAmount / slDistance
+  let lots = riskAmount / slDistance;
+  lots = Math.max(0.01, Math.min(lots, 0.10));  // Clamp between 0.01 and 0.10
+  return Math.round(lots * 100) / 100;  // Round to 2 decimals
+}
 
 // In-memory state
 let api, tradingAccount;
@@ -448,7 +458,7 @@ function mlPredict(consensus) {
 }
 
 // ============ POSITION MANAGEMENT ============
-async function openPosition(signal, price, posNum, indicators = [], candles = []) {
+async function openPosition(signal, price, posNum, indicators = [], candles = [], balance = 0) {
   const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
   const spread = (priceData.ask || price) - (priceData.bid || price);
   const spreadPct = ((spread / price) * 100).toFixed(3);
@@ -467,14 +477,10 @@ async function openPosition(signal, price, posNum, indicators = [], candles = []
     }
   }
 
-  // Use wick distance as SL, capped at $3.00 max
+  // Use wick distance as SL, with min/max bounds
   let slDistance;
-  const MAX_SL = STOP_LOSS;  // $3.00 cap
-  const MIN_SL = 0.10;  // Minimum SL to avoid noise stop-outs
-
   if (wickDistance && wickDistance > 0) {
-    // Add spread buffer to wick SL
-    slDistance = wickDistance + spread;
+    slDistance = wickDistance + spread;  // Add spread buffer
     log(`📏 Wick SL: $${wickDistance.toFixed(3)} (last ${lookback} candles ${signal === 'BUY' ? 'low' : 'high'})`);
   } else {
     slDistance = MAX_SL;
@@ -483,25 +489,32 @@ async function openPosition(signal, price, posNum, indicators = [], candles = []
   // Enforce min/max bounds
   slDistance = Math.max(MIN_SL, Math.min(slDistance, MAX_SL));
 
-  // SPREAD CHECK: reject if spread eats more than 50% of SL
-  if (spread > slDistance * 0.50) {
+  // Calculate TP using 1:3 RR ratio
+  const tpDistance = slDistance * RR_RATIO;
+
+  // Calculate lot size based on 1% risk
+  const lotSize = calcLotSize(balance, slDistance);
+
+  // SPREAD CHECK: reject if spread eats more than 30% of SL
+  if (spread > slDistance * 0.30) {
     log(`⚠️ Spread $${spread.toFixed(3)} too wide for SL $${slDistance.toFixed(2)} — SKIPPED`, 'error');
     return { success: false, error: `Spread too wide` };
   }
 
   const sl = signal === 'BUY' ? (price - slDistance).toFixed(2) : (price + slDistance).toFixed(2);
+  const tp = signal === 'BUY' ? (price + tpDistance).toFixed(2) : (price - tpDistance).toFixed(2);
 
-  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | Spread: $${spread.toFixed(3)} (${spreadPct}%) | SL: ${sl} (distance: $${slDistance.toFixed(2)})`);
+  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | Lot: ${lotSize} | SL: ${sl} ($${slDistance.toFixed(2)}) | TP: ${tp} ($${tpDistance.toFixed(2)}) | Risk: 1%`);
 
   try {
     const result = signal === 'BUY'
-      ? await tradingAccount.createMarketBuyOrder(SYMBOL, LOT_SIZE, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` })
-      : await tradingAccount.createMarketSellOrder(SYMBOL, LOT_SIZE, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` });
+      ? await tradingAccount.createMarketBuyOrder(SYMBOL, lotSize, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` })
+      : await tradingAccount.createMarketSellOrder(SYMBOL, lotSize, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` });
 
     const id = result.stringCode || result.id || 'unknown';
     log(`✅ Position opened | ID: ${id}`);
     if (indicators.length > 0) logTrade(signal, price, price, 0, indicators, 'open');
-    return { id, success: true };
+    return { id, success: true, lotSize, sl: slDistance, tp: tpDistance };
   } catch (e) {
     log(`❌ Position failed: ${e.message}`, 'error');
     return { success: false, error: e.message };
@@ -607,8 +620,8 @@ async function tradingCycle() {
     const spreadPct = ((spread / price) * 100).toFixed(3);
 
     // Log spread health check
-    const spreadOk = spread <= 3.00 && (STOP_LOSS + spread * 2) <= 3.00;
-    log(`Spread: $${spread.toFixed(3)} (${spreadPct}%) | Effective loss: $${(STOP_LOSS + spread * 2).toFixed(2)} ${spreadOk ? '✅ OK' : '⚠️ WIDE'}`);
+    const spreadOk = spread <= MAX_SL * 0.30;
+    log(`Spread: $${spread.toFixed(3)} (${spreadPct}%) | Risk: ${(RISK_PCT*100).toFixed(1)}% | RR: 1:${RR_RATIO} ${spreadOk ? '✅ OK' : '⚠️ WIDE'}`);
 
     // Build candles from real spread
     const candles = [];
@@ -725,7 +738,7 @@ async function tradingCycle() {
       if (toOpen > 0 && finalConfidence >= MIN_CONFIDENCE) {
         log(`Opening ${toOpen} ${finalSignal}(s) | Confidence: ${finalConfidence}% (min: ${MIN_CONFIDENCE}%) | ${activeCount}/${MAX_POSITIONS}`);
         for (let i = 0; i < toOpen; i++) {
-          await openPosition(finalSignal, price, i + 1, indicators, candles);
+          await openPosition(finalSignal, price, i + 1, indicators, candles, balance);
           await new Promise(r => setTimeout(r, 3000));
         }
       }
@@ -742,10 +755,10 @@ async function tradingCycle() {
 
 // ============ MAIN ============
 async function main() {
-  log('🔱 SHIVA GODMODE OVERLORD — Railway 24/7');
-  log(`📊 Symbol: ${SYMBOL} | Lot: ${LOT_SIZE} | Max: ${MAX_POSITIONS}`);
-  log(`📏 SL: Wick-based (max $${STOP_LOSS}) | BE: +$${BREAKEVEN_AT} | TP: $3.00`);
-  log(`⏱️  Check interval: ${CHECK_INTERVAL / 1000}s`);
+  log('🔱 SHIVA GODMODE OVERLORD — HFT 24/7');
+  log(`📊 Symbol: ${SYMBOL} | Risk: ${(RISK_PCT*100).toFixed(1)}% | RR: 1:${RR_RATIO} | Max: ${MAX_POSITIONS}`);
+  log(`📏 SL: Wick-based (max $${MAX_SL}) | BE: +$${BREAKEVEN_AT} | TP: 1:${RR_RATIO}`);
+  log(`⚡ Check interval: ${CHECK_INTERVAL / 1000}s (HFT mode)`);
 
   // Test Redis connection
   try {
