@@ -441,10 +441,39 @@ function mlPredict(consensus) {
 }
 
 // ============ POSITION MANAGEMENT ============
-async function openPosition(signal, price, posNum, indicators = []) {
+async function openPosition(signal, price, posNum, indicators = [], candles = []) {
   const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
   const spread = (priceData.ask || price) - (priceData.bid || price);
   const spreadPct = ((spread / price) * 100).toFixed(3);
+
+  // WICK-BASED SL: find last swing wick from recent candles
+  let wickSL = null;
+  const lookback = Math.min(candles.length, 10);
+  if (lookback >= 3 && candles.length > 0) {
+    const recentCandles = candles.slice(-lookback);
+    if (signal === 'BUY') {
+      const swingLow = Math.min(...recentCandles.map(c => c.low));
+      wickSL = price - swingLow;  // distance from price to swing low
+    } else {
+      const swingHigh = Math.max(...recentCandles.map(c => c.high));
+      wickSL = swingHigh - price;  // distance from swing high to price
+    }
+  }
+
+  // Use wick SL if valid, otherwise fall back to configured STOP_LOSS
+  let slDistance;
+  if (wickSL && wickSL > 0 && wickSL <= STOP_LOSS) {
+    slDistance = wickSL + spread;  // SL just past the wick (+ spread buffer)
+    log(`📏 Wick-based SL: $${wickSL.toFixed(3)} (swing ${signal === 'BUY' ? 'low' : 'high'})`);
+  } else {
+    slDistance = STOP_LOSS + (spread * 2);
+    if (wickSL && wickSL > STOP_LOSS) {
+      log(`⚠️ Wick SL $${wickSL.toFixed(3)} exceeds max $${STOP_LOSS}, using capped SL`);
+    }
+  }
+
+  // Cap SL at configured max
+  const cappedSL = Math.min(slDistance, STOP_LOSS + spread * 2);
 
   // SPREAD CHECK: reject if spread exceeds $3.00
   const maxSpread = 3.00;
@@ -453,22 +482,14 @@ async function openPosition(signal, price, posNum, indicators = []) {
     return { success: false, error: `Spread too wide: $${spread.toFixed(3)}` };
   }
 
-  // Total effective loss (SL + spread cost) must not exceed $3.00
-  const effectiveLoss = STOP_LOSS + (spread * 2);
+  // Total effective loss must not exceed $3.00
+  const effectiveLoss = cappedSL + spread;
   if (effectiveLoss > 3.00) {
-    log(`⚠️ Effective loss $${effectiveLoss.toFixed(2)} exceeds $3.00 max (SL: $${STOP_LOSS} + spread cost: $${(spread * 2).toFixed(3)}) — SKIPPED`, 'error');
+    log(`⚠️ Effective loss $${effectiveLoss.toFixed(2)} exceeds $3.00 max — SKIPPED`, 'error');
     return { success: false, error: `Effective loss exceeds $3.00 max` };
   }
 
-  // SL must be at least 2x spread to avoid instant stop-outs
-  const minSL = spread * 2;
-  if (STOP_LOSS < minSL) {
-    log(`⚠️ SL $${STOP_LOSS.toFixed(2)} too tight for spread $${spread.toFixed(3)} (need >= $${minSL.toFixed(2)}) — SKIPPED`, 'error');
-    return { success: false, error: `SL too tight for spread` };
-  }
-
-  const totalSL = STOP_LOSS + (spread * 2);
-  const sl = signal === 'BUY' ? (price - totalSL).toFixed(2) : (price + totalSL).toFixed(2);
+  const sl = signal === 'BUY' ? (price - cappedSL).toFixed(2) : (price + cappedSL).toFixed(2);
 
   log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | Spread: $${spread.toFixed(3)} (${spreadPct}%) | SL: ${sl}`);
 
@@ -677,7 +698,7 @@ async function tradingCycle() {
       if (toOpen > 0 && finalConfidence >= 40) {
         log(`Opening ${toOpen} ${finalSignal}(s) | Confidence: ${finalConfidence}% | ${activeCount}/${MAX_POSITIONS}`);
         for (let i = 0; i < toOpen; i++) {
-          await openPosition(finalSignal, price, i + 1, indicators);
+          await openPosition(finalSignal, price, i + 1, indicators, candles);
           await new Promise(r => setTimeout(r, 3000));
         }
       }
