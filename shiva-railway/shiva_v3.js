@@ -1279,7 +1279,7 @@ class ShivaBot {
           }
         } else { console.log(colors.yellow(`⏸️ Skip: ${cd.reason||`Max pos (${openPos}/${CONFIG.MAX_POSITIONS})`}`)); }
       } else {
-        const reason=!voteResult.shouldTrade?`Score ${(voteResult.score*100).toFixed(1)}% < 65%`:!spreadChk.passed?spreadChk.reason:!dailyChk.passed?dailyChk.reason:ddChk.reason;
+        const reason=!voteResult.shouldTrade?`Score ${(voteResult.score*100).toFixed(1)}% < ${(CONFIG.MIN_SCORE_THRESHOLD*100).toFixed(0)}%`:!spreadChk.passed?spreadChk.reason:!dailyChk.passed?dailyChk.reason:ddChk.reason;
         console.log(colors.yellow(`⏸️ HOLD: ${reason}`));
       }
 
