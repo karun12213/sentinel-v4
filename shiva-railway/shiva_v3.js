@@ -1246,7 +1246,26 @@ class ShivaBot {
         if (cd.canTrade&&openPos<CONFIG.MAX_POSITIONS) {
           const price=this.marketData.price.bid, signal=voteResult.direction;
           const lastCandle=this.marketData.getLatestCandle();
-          const slDist=lastCandle?Math.max(0.15,Math.min(lastCandle.high-lastCandle.low,2.0)):0.5;
+          
+          // Tighter SL: use the wick only (bottom wick for BUY, top wick for SELL)
+          let slDist;
+          if (lastCandle) {
+            const close=lastCandle.close;
+            if (signal==='BUY') {
+              // BUY: SL below the bottom wick (close - low), add small buffer
+              const bottomWick = close - lastCandle.low;
+              slDist = Math.max(0.10, Math.min(bottomWick + 0.05, 1.50));
+              console.log(colors.cyan(`  📏 Wick SL: bottom wick=$${bottomWick.toFixed(3)} → SL dist=$${slDist.toFixed(3)}`));
+            } else {
+              // SELL: SL above the top wick (high - close), add small buffer
+              const topWick = lastCandle.high - close;
+              slDist = Math.max(0.10, Math.min(topWick + 0.05, 1.50));
+              console.log(colors.cyan(`  📏 Wick SL: top wick=$${topWick.toFixed(3)} → SL dist=$${slDist.toFixed(3)}`));
+            }
+          } else {
+            slDist = 0.50;
+          }
+          
           const tpDist=slDist*CONFIG.RR_RATIO;
           const lotSize=this.riskManager.calculateLotSize(voteResult.score,balance,slDist,curATR);
 
