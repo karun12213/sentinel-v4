@@ -47,7 +47,7 @@ const CONFIG = {
   MAX_POSITIONS: 2,
   MAX_DAILY_LOSS_PCT: 0.05,
   MAX_DRAWDOWN_PCT: 0.10,
-  MIN_LOT: 0.01, MAX_LOT: 0.10,
+  MIN_LOT: 0.01, MAX_LOT: 0.03,       // Max 0.03 lot for $100 account
   MAX_SPREAD: 0.12,                   // Adjusted for USOIL on Axiory
   MIN_SCORE_THRESHOLD: 0.10,          // Take trades at 10%+ score
   TRADE_COOLDOWN: 9 * 60 * 1000,      // 9 min cooldown between trades
@@ -928,9 +928,11 @@ class RiskManager {
   }
 
   calculateLotSize(scorePct,balance,slDistance,atr) {
+    // USOIL: 1 lot = 1000 barrels, $1 move = $1000 per lot, 0.01 lot = $10 per $1
+    // Lot size = riskAmount / (slDistance * contractValuePerLot)
     const riskAmt=balance*CONFIG.RISK_PCT;
-    // USOIL: 0.01 lot = $10 per $1 move
-    let lot=riskAmt/(slDistance*10);
+    const contractValue=1000; // $1000 per $1 move per 1 lot
+    let lot=riskAmt/(slDistance*contractValue);
     if (scorePct>0.85) lot*=1.5;
     else if (scorePct>0.75) lot*=1.2;
     else lot*=0.8;
