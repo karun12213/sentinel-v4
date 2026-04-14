@@ -1272,7 +1272,55 @@ class ShivaBot {
         const cd=this.tradeExecutor.canTrade();
         if (cd.canTrade&&openPos<CONFIG.MAX_POSITIONS) {
           const price=this.marketData.price.bid, signal=voteResult.direction;
-          const lastCandle=this.marketData.getLatestCandle();
+
+          // ── 1-MINUTE CANDLE CONFIRMATION ──
+          // Fetch last 15 one-minute candles to confirm momentum before entry
+          let m1Confirm = { passed: true, note: '1-min check failed' };
+          try {
+            const m1Raw = await retryWithBackoff(()=>this.metaAccount.getHistoricalCandles(CONFIG.SYMBOL, '1m'), 2, 2000);
+            const m1Candles = m1Raw.slice(-15).map(c=>({
+              open:parseFloat(c.open), high:parseFloat(c.high), low:parseFloat(c.low), close:parseFloat(c.close)
+            })).filter(c=>c.open>0);
+
+            if (m1Candles.length >= 5) {
+              // Count bullish/bearish momentum in last 15 min candles
+              let bullCount=0, bearCount=0, totalMove=0;
+              m1Candles.forEach(c => {
+                if (c.close > c.open) bullCount++;
+                else if (c.close < c.open) bearCount++;
+              });
+              const firstPrice = m1Candles[0].open;
+              const lastPrice = m1Candles[m1Candles.length-1].close;
+              const priceMove = ((lastPrice - firstPrice) / firstPrice) * 100;
+              totalMove = Math.abs(priceMove);
+
+              // Confirm: at least 60% of min candles align with signal direction
+              const bullishMajority = bullCount >= bearCount;
+              const bearishMajority = bearCount >= bullCount;
+              const aligns = (signal==='BUY'&&bullishMajority)||(signal==='SELL'&&bearishMajority);
+
+              console.log(colors.magenta(`  🔬 1-MIN CHECK: ${m1Candles.length} candles | Bull:${bullCount} Bear:${bearCount} | Move: ${priceMove>=0?'+':''}${priceMove.toFixed(3)}%`));
+
+              if (!aligns) {
+                m1Confirm = { passed: false, note: `1-min momentum opposes: ${bullCount}B vs ${bearCount}b` };
+                console.log(colors.red(`  ❌ 1-min confirmation FAILED — skipping trade`));
+              } else if (totalMove < 0.02) {
+                m1Confirm = { passed: false, note: `1-min range too tight: ${totalMove.toFixed(3)}%` };
+                console.log(colors.red(`  ❌ 1-min range too tight — skipping trade`));
+              } else {
+                m1Confirm = { passed: true, note: `1-min confirms: ${bullCount}B/${bearCount}b, move ${priceMove>=0?'+':''}${priceMove.toFixed(3)}%` };
+                console.log(colors.green(`  ✅ 1-min CONFIRMED: ${m1Confirm.note}`));
+              }
+            }
+          } catch(e) {
+            console.log(colors.yellow(`  ⚠ 1-min fetch failed (${e.message}), allowing trade`));
+            m1Confirm = { passed: true, note: '1-min fetch failed' };
+          }
+
+          if (!m1Confirm.passed) {
+            console.log(colors.yellow(`  ⏸️ Trade REJECTED by 1-min filter: ${m1Confirm.note}`));
+          } else {
+            const lastCandle=this.marketData.getLatestCandle();
           
           // Tighter SL: use the wick only (bottom wick for BUY, top wick for SELL)
           let slDist;
@@ -1304,6 +1352,7 @@ class ShivaBot {
             await this.performanceTracker.save();
             await this.mlConfidence.save();
           }
+          } // end if m1Confirm.passed
         } else { console.log(colors.yellow(`⏸️ Skip: ${cd.reason||`Max pos (${openPos}/${CONFIG.MAX_POSITIONS})`}`)); }
       } else {
         const reason=!voteResult.shouldTrade?`Score ${(voteResult.score*100).toFixed(1)}% < ${(CONFIG.MIN_SCORE_THRESHOLD*100).toFixed(0)}%`:!spreadChk.passed?spreadChk.reason:!dailyChk.passed?dailyChk.reason:ddChk.reason;
