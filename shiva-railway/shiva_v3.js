@@ -49,7 +49,7 @@ const CONFIG = {
   MAX_DRAWDOWN_PCT: 0.10,
   MIN_LOT: 0.01, MAX_LOT: 0.10,
   MAX_SPREAD: 0.12,                   // Adjusted for USOIL on Axiory
-  MIN_SCORE_THRESHOLD: 0.15,          // Very low - take most directional trades
+  MIN_SCORE_THRESHOLD: 0.10,          // Take trades at 10%+ score
   TRADE_COOLDOWN: 9 * 60 * 1000,      // 9 min cooldown between trades
   KILL_ZONES: {
     london: { start: 7, end: 10 },
