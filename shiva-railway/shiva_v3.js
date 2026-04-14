@@ -42,15 +42,15 @@ const CONFIG = {
   TIMEFRAME_MINUTES: 15,
   POSITION_MONITOR_INTERVAL: 30000,
   SPREAD_CHECK_INTERVAL: 60000,
-  TRADE_COOLDOWN: 5 * 60 * 1000,     // 5 minutes
-  RISK_PCT: 0.015,                    // 1.5% per trade
+  RISK_PCT: 0.025,                    // 2.5% per trade (increased for more action)
   RR_RATIO: 2.5,
   MAX_POSITIONS: 2,
   MAX_DAILY_LOSS_PCT: 0.05,
   MAX_DRAWDOWN_PCT: 0.10,
   MIN_LOT: 0.01, MAX_LOT: 0.10,
   MAX_SPREAD: 0.12,                   // Adjusted for USOIL on Axiory
-  MIN_SCORE_THRESHOLD: 0.65,
+  MIN_SCORE_THRESHOLD: 0.40,          // Take trades at 40%+ score
+  TRADE_COOLDOWN: 2 * 60 * 1000,      // 2 min cooldown between trades
   KILL_ZONES: {
     london: { start: 7, end: 10 },
     newYork: { start: 12, end: 15 },
