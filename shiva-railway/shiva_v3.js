@@ -49,8 +49,8 @@ const CONFIG = {
   MAX_DRAWDOWN_PCT: 0.10,
   MIN_LOT: 0.01, MAX_LOT: 0.10,
   MAX_SPREAD: 0.12,                   // Adjusted for USOIL on Axiory
-  MIN_SCORE_THRESHOLD: 0.40,          // Take trades at 40%+ score
-  TRADE_COOLDOWN: 2 * 60 * 1000,      // 2 min cooldown between trades
+  MIN_SCORE_THRESHOLD: 0.15,          // Very low - take most directional trades
+  TRADE_COOLDOWN: 9 * 60 * 1000,      // 9 min cooldown between trades
   KILL_ZONES: {
     london: { start: 7, end: 10 },
     newYork: { start: 12, end: 15 },
@@ -1337,15 +1337,13 @@ class ShivaBot {
       }
     },CONFIG.SPREAD_CHECK_INTERVAL);
 
-    // M15 synced cycle
+    // 9-minute cycle loop (takes trades every 9 minutes)
     const runCycle=async ()=>{
       if (!this.running) return;
       await this.runCycle();
-      const ms15=15*60*1000;
-      const next=Math.ceil(Date.now()/ms15)*ms15;
-      const delay=next-Date.now();
-      console.log(colors.gray(`  ⏳ Next M15 cycle in ${Math.round(delay/1000/60*10)/10} min`));
-      setTimeout(runCycle,delay);
+      const interval=9*60*1000;
+      console.log(colors.gray(`  ⏳ Next cycle in 9 min`));
+      setTimeout(runCycle,interval);
     };
 
     await runCycle();
