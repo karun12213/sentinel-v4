@@ -988,34 +988,35 @@ class PositionManager {
         const st=this.posStates.get(pk);
         if (profit>st.peakProfit) st.peakProfit=profit;
 
-        // BREAKEVEN: close when profit >= 0.30
-        if (!st.breakevenSet&&profit>=0.30) {
+        // BREAKEVEN: close when profit >= $1.00 (was $0.30 — let winners breathe)
+        if (!st.breakevenSet&&profit>=1.00) {
           try {
             await this.connection.closePosition(pk);
-            console.log(colors.yellow(`  🟡 BREAKEVEN: Closed ${pk.slice(0,8)} at $${profit.toFixed(2)}`));
+            console.log(colors.yellow(`  🟡 BREAKEVEN: Closed ${pk.slice(0,8)} at +$${profit.toFixed(2)}`));
             this.posStates.delete(pk); continue;
           } catch(e) { console.log(colors.yellow(`  ⚠ BE failed: ${e.message}`)); }
         }
 
-        // TRAIL: close if profit drops 0.20 from peak
-        if (st.peakProfit>=0.50&&profit<st.peakProfit-0.20) {
+        // TRAIL: hold longer — trail from $1.50 peak, $0.40 pullback (was $0.50/$0.20)
+        if (st.peakProfit>=1.50&&profit<st.peakProfit-0.40) {
           try {
             await this.connection.closePosition(pk);
-            console.log(colors.green(`  🟢 TRAIL: Closed ${pk.slice(0,8)} | Peak: $${st.peakProfit.toFixed(2)} → $${profit.toFixed(2)}`));
+            console.log(colors.green(`  🟢 TRAIL: Closed ${pk.slice(0,8)} | Peak: +$${st.peakProfit.toFixed(2)} → $${profit.toFixed(2)}`));
             this.posStates.delete(pk); continue;
           } catch(e) {}
         }
 
-        // HARD TP at $5
-        if (profit>=5.00) {
+        // HARD TP at $8 (was $5 — hold winners longer)
+        if (profit>=8.00) {
           try {
             await this.connection.closePosition(pk);
-            console.log(colors.green(`  🟢 TAKE PROFIT: Closed ${pk.slice(0,8)} at $${profit.toFixed(2)}`));
+            console.log(colors.green(`  🟢 TAKE PROFIT: Closed ${pk.slice(0,8)} at +$${profit.toFixed(2)}`));
             this.posStates.delete(pk); continue;
           } catch(e) {}
         }
 
-        if (profit>=0.10) console.log(colors.green(`  📈 HOLDING ${pk.slice(0,8)} | PnL: +$${profit.toFixed(2)} | Peak: $${st.peakProfit.toFixed(2)}`));
+        if (profit>=0.50) console.log(colors.green(`  💪 HOLDING ${pk.slice(0,8)} | +$${profit.toFixed(2)} | Peak: +$${st.peakProfit.toFixed(2)} | BE:$1 | Trail:$1.50`));
+        else if (profit>=0.10) console.log(colors.green(`  📈 HOLDING ${pk.slice(0,8)} | +$${profit.toFixed(2)}`));
       }
       return myPos.length;
     } catch(e) { console.log(colors.red(`  ❌ Pos manage error: ${e.message}`)); return 0; }
