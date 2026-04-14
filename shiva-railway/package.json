@@ -1,12 +1,20 @@
 {
-  "name": "shiva-trading-bot",
-  "version": "1.0.0",
-  "description": "SHIVA Live Trading Bot - 40 NVIDIA Agents with ICT + ML",
+  "name": "shiva-v3-trading-bot",
+  "version": "3.0.0",
+  "description": "SHIVA V3 — 40-Agent Voting System for WTI Crude Oil (USOIL M15)",
+  "main": "shiva_v3.js",
   "dependencies": {
-    "metaapi.cloud-sdk": "latest",
-    "@upstash/redis": "latest"
+    "@upstash/redis": "latest",
+    "chalk": "^4.1.2",
+    "dotenv": "^17.4.2",
+    "fs-extra": "^11.3.4",
+    "luxon": "^3.7.2",
+    "metaapi.cloud-sdk": "latest"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node shiva_v3.js"
   }
 }

@@ -4,8 +4,8 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "node bot.js",
+    "startCommand": "node shiva_v3.js",
     "restartPolicyType": "ALWAYS",
-    "restartPolicyMaxRetries": 5
+    "restartPolicyMaxRetries": 10
   }
 }
