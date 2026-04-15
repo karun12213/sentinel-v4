@@ -7,30 +7,45 @@
 const MetaApi = require('metaapi.cloud-sdk').default;
 const { execSync } = require('child_process');
 const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 // ============ CONFIG ============
+// Load credentials from .shiva_env
+function loadEnvFile() {
+  const envPath = path.join(os.homedir(), '.shiva_env');
+  try {
+    const content = fs.readFileSync(envPath, 'utf8');
+    content.split('\n').forEach(line => {
+      line = line.trim();
+      if (line && !line.startsWith('#')) {
+        const eqIdx = line.indexOf('=');
+        if (eqIdx > 0) {
+          const key = line.substring(0, eqIdx);
+          const val = line.substring(eqIdx + 1).trim();
+          if (!process.env[key]) {
+            process.env[key] = val;
+          }
+        }
+      }
+    });
+  } catch (e) {
+    console.log('⚠️ Could not load ~/.shiva_env, using env vars');
+  }
+}
+loadEnvFile();
+
 const TOKEN = process.env.METAAPI_TOKEN || '';
 const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID || '';
-const SYMBOL = process.env.SYMBOL || 'XTIUSD';
-const LOT_SIZE = 0.01; // Minimum lot size (ultra-safe for small accounts)
-const POSITIONS = 2; // Will be auto-adjusted based on balance
-const ENTRY_GAP_MS = 5000;
-const STOP_LOSS = 1.50; // Stop loss in dollars for XTIUSD
-const TRAIL_START = 0.50; // Trail winners when profit > $0.50
-const TRAIL_DISTANCE = 0.25;
+const SYMBOL = 'SpotCrude';
+const LOT_SIZE = 0.03;
+const POSITIONS = 6;
+const ENTRY_GAP_MS = 3000;
+const STOP_LOSS = 0.30;
+const TAKE_PROFIT = 0.60;
 const CHECK_INTERVAL = 30000;
-const MAX_TRADES_PER_CYCLE = 6; // Will be auto-adjusted based on balance
-const ML_RETRAIN_INTERVAL = 5;
-const MAX_DRAWDOWN_PCT = 20;
-const RISK_PER_TRADE_PCT = 2;
-const MIN_BALANCE_THRESHOLD = 3.00;
-
-// Dynamic position sizing based on balance
-function getDynamicPositions(balance) {
-  if (balance >= 100) return 6; // $100+ = 6 positions
-  if (balance >= 50) return 4;  // $50-99 = 4 positions
-  return 2; // Below $50 = 2 positions (ultra-safe)
-}
+const MAX_TRADES_PER_CYCLE = 6;
+const ML_RETRAIN_INTERVAL = 5; // Retrain ML every 5 cycles
 
 // ============ STATE ============
 let api, connection, tradingAccount;
@@ -75,179 +90,6 @@ function logTrade(signal, entry, exit, pnl, agents, reason) {
   tradeHistory.push(trade);
   saveTradeHistory();
   console.log(`📝 Trade logged: ${trade.id} | ${signal} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | ${reason}`);
-}
-
-// ============ DISCORD INTEGRATION ============
-const DISCORD_WEBHOOK = process.env.DISCORD_TRADES || '';
-
-function postToDiscordOnPositionOpen(signal, price, sl, posNum, id) {
-  if (!DISCORD_WEBHOOK) return;
-
-  const tp = 'TRAIL — winners run until trend breaks';
-  const arrow = signal === 'BUY' ? '📈' : '📉';
-  const color = signal === 'BUY' ? 0x00FF88 : 0xFF4444;
-
-  const payload = {
-    embeds: [{
-      title: `${arrow} Position #${posNum} Opened — ${signal}`,
-      color: color,
-      fields: [
-        { name: '🎯 Entry', value: `\`$${price.toFixed(3)}\``, inline: true },
-        { name: '🛑 Stop Loss', value: `\`$${sl}\``, inline: true },
-        { name: '📈 Take Profit', value: `\`${tp}\``, inline: true },
-        { name: '📋 Direction', value: `**${signal}**`, inline: true },
-        { name: '💰 Lot Size', value: `\`${LOT_SIZE}\``, inline: true },
-        { name: '🆔 Trade ID', value: `\`${id.slice(0, 16)}\``, inline: true },
-        {
-          name: '💡 Note',
-          value: `\`${signal}\` signal from AI consensus. ` +
-                 `SL trails to breakeven once in profit. Let winners run!`,
-          inline: false,
-        },
-      ],
-      footer: { text: '🔱 SHIVA Godmode Overload — Position Opened' },
-      timestamp: new Date().toISOString(),
-    }],
-  };
-
-  try {
-    const curl = `curl -s -X POST "${DISCORD_WEBHOOK}" ` +
-      `-H "Content-Type: application/json" ` +
-      `-d '${JSON.stringify(payload).replace(/'/g, "'\\''")}'`;
-    execSync(curl, { timeout: 10000 });
-    console.log(`📤 Posted position #${posNum} to Discord`);
-  } catch (e) {
-    console.log(`⚠ Discord post failed: ${e.message}`);
-  }
-}
-
-function postToDiscordOnTradeClose(signal, pnl, reason, peakPnl = null) {
-  if (!DISCORD_WEBHOOK) return;
-
-  const isWin = pnl > 0;
-  const emoji = isWin ? '🟢' : '🔴';
-  const color = isWin ? 0x00FF88 : 0xFF4444;
-  const result = isWin ? 'WIN' : 'LOSS';
-
-  let reasonText = '';
-  if (reason === 'take_profit') {
-    reasonText = '🟢 Hit target / trailed to profit';
-  } else if (reason === 'cut_loss') {
-    reasonText = '🔴 Stop loss hit — risk managed';
-  } else {
-    reasonText = `Exit: ${reason}`;
-  }
-
-  const note = isWin
-    ? '`Winner banked. Trail system worked. Let the next one run too.`'
-    : '`Losses are part of the edge. Stay disciplined.`';
-
-  const fields = [
-    { name: '📈 Signal', value: `**${signal}**`, inline: true },
-    { name: '💵 PnL', value: `\`$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\``, inline: true },
-    { name: '📝 Exit', value: reasonText, inline: true },
-    { name: '💡 Note', value: note, inline: false },
-  ];
-
-  if (peakPnl !== null) {
-    fields.splice(2, 0, { name: '🏔 Peak PnL', value: `\`+$${peakPnl.toFixed(2)}\``, inline: true });
-  }
-
-  const payload = {
-    embeds: [{
-      title: `${emoji} Trade Closed — ${result}`,
-      color: color,
-      fields: fields,
-      footer: { text: '🔱 SHIVA Godmode Overload — Trade Closed' },
-      timestamp: new Date().toISOString(),
-    }],
-  };
-
-  try {
-    const curl = `curl -s -X POST "${DISCORD_WEBHOOK}" ` +
-      `-H "Content-Type: application/json" ` +
-      `-d '${JSON.stringify(payload).replace(/'/g, "'\\''")}'`;
-    execSync(curl, { timeout: 10000 });
-    console.log(`📤 Posted trade ${result} to Discord: $${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}`);
-  } catch (e) {
-    console.log(`⚠ Discord post failed: ${e.message}`);
-  }
-}
-
-function postPeriodicSignalToDiscord(consensus, price, equity, balance, pnl, indicators, openPositions = 0) {
-  if (!DISCORD_WEBHOOK) return;
-
-  const signal = consensus.signal;
-  const strength = consensus.pct;
-  const colors = { BUY: 0x00FF88, SELL: 0xFF4444, HOLD: 0xFFAA00 };
-
-  // Fetch actual SL from managed positions (bot decides, not hardcoded)
-  let slDisplay = 'Bot Managed';
-  if (managedPositions.length > 0) {
-    const avgSl = managedPositions.reduce((sum, p) => sum + (p.sl || p.beSl || 0), 0) / managedPositions.length;
-    slDisplay = `$${avgSl.toFixed(3)}`;
-  }
-
-  const tradePlanText = `Entry: \`$${price.toFixed(3)}\`\n**SL**: \`${slDisplay}\` (Bot Managed)\nTake Profit: \`TRAIL — winners run until trend breaks\`\nLot Size: \`${LOT_SIZE}\``;
-
-  const agreeingAgents = indicators.filter(i => i.s === signal).slice(0, 5);
-  const agentList = agreeingAgents.map(a => `${a.e} ${a.n}`).join('\n') || '—';
-
-  const histWins = tradeHistory.filter(t => t.result === 'win').length;
-  const histLosses = tradeHistory.filter(t => t.result === 'loss').length;
-
-  const payload = {
-    embeds: [{
-      title: `SHIVA Signal Cycle #${cycle}`,
-      description: `**${signal}** (${strength}% confidence)`,
-      color: colors[signal] || 0x4488FF,
-      fields: [
-        {
-          name: '📊 Market Data',
-          value: `Price: \`$${price.toFixed(3)}\` | Symbol: \`${SYMBOL}\`\nEquity: \`$${equity.toFixed(2)}\` | Balance: \`$${balance.toFixed(2)}\`\nPnL: \`$${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}\``,
-          inline: false,
-        },
-        { name: '🎯 Trade Plan', value: tradePlanText, inline: false },
-        {
-          name: '🤖 AI Consensus',
-          value: `🟢 BUY: \`${consensus.buy}\` | 🔴 SELL: \`${consensus.sell}\` | ⚪ HOLD: \`${consensus.hold}\``,
-          inline: false,
-        },
-        { name: '✅ Top Agents', value: agentList, inline: false },
-        { name: '📋 Positions', value: `${openPositions}/${POSITIONS}`, inline: true },
-        { name: '📈 Record', value: `Wins: \`${histWins}\` | Losses: \`${histLosses}\``, inline: true },
-        {
-          name: '📝 Instructions',
-          value: '1. **Bot auto-executes** — no manual intervention needed\n' +
-                 '2. **Do NOT manually close** — bot trails winners & cuts losers\n' +
-                 '3. **SL moves to breakeven** once position is in profit\n' +
-                 '4. **Let winners run** — trail system handles exits\n' +
-                 '5. **Losers cut at -$0.50** — small losses preserve capital\n' +
-                 '6. **Monitor Discord** for auto-updates on every trade event',
-          inline: false,
-        },
-        {
-          name: '💡 Note',
-          value: '`SHIVA Godmode Overload is fully automated on Vercel/Railway (24/7). ' +
-                 '40 AI agents scan every 30s. Max 6 positions. ' +
-                 'Trust the system. Stay disciplined.`',
-          inline: false,
-        },
-      ],
-      footer: { text: '🔱 SHIVA Godmode Overload — Vercel/Railway 24/7' },
-      timestamp: new Date().toISOString(),
-    }],
-  };
-
-  try {
-    const curl = `curl -s -X POST "${DISCORD_WEBHOOK}" ` +
-      `-H "Content-Type: application/json" ` +
-      `-d '${JSON.stringify(payload).replace(/'/g, "'\\''")}'`;
-    execSync(curl, { timeout: 10000 });
-    console.log(`📤 Posted periodic signal to Discord: ${signal} (${strength}%)`);
-  } catch (e) {
-    console.log(`⚠ Discord periodic post failed: ${e.message}`);
-  }
 }
 
 // ============ ML ENGINE ============
@@ -317,8 +159,10 @@ function trainInlineML(agents, signal) {
 }
 
 // ============ MT4 CONNECTION ============
-async function connectMT4() {
-  console.log('🔗 Connecting to MT4...');
+async function connectMT4(maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log('🔗 Connecting to MT4...');
   api = new MetaApi(TOKEN, {
     provisioningUrl: 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai',
     mtUrl: 'https://mt-client-api-v1.london.agiliumtrade.agiliumtrade.ai'
@@ -339,21 +183,45 @@ async function connectMT4() {
   initialEquity = info.equity || 0;
   console.log(`✅ CONNECTED | Balance: $${info.balance} | Equity: $${info.equity}`);
 
-  // Check existing positions on connect
+  // Load existing positions into managedPositions for SL management
   try {
     const existingPositions = await connection.getPositions();
     const symbolPositions = existingPositions.filter(p => p.symbol === SYMBOL);
-    console.log(`📊 Found ${symbolPositions.length} existing ${SYMBOL} position(s) on connect`);
+    console.log(`📊 Found ${symbolPositions.length} existing ${SYMBOL} position(s) — loading into management`);
     if (symbolPositions.length > 0) {
-      symbolPositions.forEach((p, i) => {
-        console.log(`  #${i+1} ${p.type} @ ${p.openPrice} | PnL: $${(p.profit||0).toFixed(2)}`);
-      });
+      for (const p of symbolPositions) {
+        const posType = p.type.includes('BUY') ? 'BUY' : 'SELL';
+        managedPositions.push({
+          id: p.id || `${p.openTime}-${p.openPrice}`,
+          type: posType,
+          entry: p.openPrice,
+          sl: p.stopLoss || 0,
+          spread: 0,
+          highestPnl: Math.max(0, p.profit || 0),
+          currentProfit: p.profit || 0,
+          beMoved: false,
+          trailing: false
+        });
+        console.log(`  ✅ Tracking ${posType} @ ${p.openPrice} | SL: ${p.stopLoss || 'none'} | PnL: $${(p.profit||0).toFixed(2)}`);
+      }
+      console.log(`🛡️ ${managedPositions.length} positions loaded for SL management`);
     }
   } catch (e) {
-    console.log(`⚠ Could not check positions on connect: ${e.message}`);
+    console.log(`⚠ Could not load positions: ${e.message}`);
   }
 
   return info;
+} catch (e) {
+    if (e.message.includes('429') || e.message.includes('rate') || e.message.includes('Timed out') || e.message.includes('timeout')) {
+      const waitTime = attempt * 15000;
+      console.log('⏳ Rate limited. Retrying in ' + waitTime/1000 + 's...');
+      await new Promise(r => setTimeout(r, waitTime));
+      if (attempt === maxRetries) throw e;
+    } else {
+      throw e;
+    }
+  }
+}
 }
 
 // ============ 40 NVIDIA AGENTS ============
@@ -448,6 +316,49 @@ function analyzeAll(candles, price) {
   s=candles.length>=13?(()=>{const e=ema(closes.slice(-13),13).slice(-1)[0];return last.high-e>0&&last.low-e<0?'BUY':'SELL';})():'HOLD';
   results.push({e:'🐘',n:'Elder Ray',s:fb(s)});
   results.push({e:'💪',n:'ForceIdx',s:fb((closes[closes.length-1]-closes[closes.length-2])*volumes[volumes.length-1]>0?'BUY':'SELL')});
+
+  // BOTTOM WICK: Price is in the lower wick zone (buying opportunity)
+  s=candles.length>=5?(()=>{
+    const recentCandles = candles.slice(-5);
+    let inWick = false;
+    for (const c of recentCandles) {
+      const body = Math.abs(c.close - c.open);
+      const range = c.high - c.low;
+      const lowerWick = Math.min(c.close, c.open) - c.low;
+      const upperWick = c.high - Math.max(c.close, c.open);
+      // Price is in lower wick if it's below the body
+      const wickZone = c.low + (lowerWick * 0.5);
+      if (price <= wickZone && lowerWick > body * 0.3) {
+        inWick = true;
+        break;
+      }
+    }
+    return inWick ? 'BUY' : 'HOLD';
+  })():'HOLD';
+  results.push({e:'🕯️',n:'BottomWick',s});
+
+  // FIB GOLDEN ZONE: Price at 0.618-0.65 retracement (prime entry zone)
+  s=candles.length>=20?(()=>{
+    const hh = Math.max(...highs.slice(-20));
+    const ll = Math.min(...lows.slice(-20));
+    const range = hh - ll;
+    const fib618 = ll + range * 0.618;
+    const fib650 = ll + range * 0.650;
+    const fib500 = ll + range * 0.500;
+    const goldenZoneLow = fib618 - (range * 0.02);  // Small buffer
+    const goldenZoneHigh = fib650 + (range * 0.02);
+    // Price in golden zone
+    if (price >= goldenZoneLow && price <= goldenZoneHigh) {
+      return 'BUY';  // Retracement buy zone
+    }
+    // Also check 0.5 level for early entry
+    if (price >= fib500 && price <= fib618) {
+      return 'BUY';  // Pre-golden zone
+    }
+    return 'HOLD';
+  })():'HOLD';
+  results.push({e:'🔱',n:'FibGolden',s});
+
   return results;
 }
 
@@ -457,11 +368,21 @@ function getConsensus(indicators) {
   const hold = indicators.filter(i => i.s === 'HOLD').length;
   const total = buy + sell;
   if (total === 0) return { signal: 'HOLD', buy, sell, hold, pct: 0 };
-  const buyPct = Math.round((buy / total) * 100);
+
+  // Extra weight for high-probability zones (bottom wick, fib golden)
+  const bottomWick = indicators.find(i => i.n === 'BottomWick');
+  const fibGolden = indicators.find(i => i.n === 'FibGolden');
+  let bonusWeight = 0;
+  if (bottomWick?.s === 'BUY') bonusWeight += 2;  // +2 votes for bottom wick
+  if (fibGolden?.s === 'BUY') bonusWeight += 3;   // +3 votes for fib golden zone (stronger)
+
+  const adjustedBuy = buy + bonusWeight;
+  const adjustedTotal = adjustedBuy + sell;
+  const buyPct = Math.round((adjustedBuy / adjustedTotal) * 100);
   const sellPct = 100 - buyPct;
   const signal = buyPct > sellPct ? 'BUY' : buyPct < sellPct ? 'SELL' : 'HOLD';
   const strength = signal === 'BUY' ? buyPct : sellPct;
-  return { signal, buy, sell, hold, pct: strength };
+  return { signal, buy: adjustedBuy, sell, hold, pct: strength, rawBuy: buy, rawSell: sell };
 }
 
 // ============ DISPLAY ============
@@ -495,7 +416,7 @@ function printDashboard(equity, price, consensus, pnl, indicators, positions) {
       const pnlIcon = p.profit >= 0 ? '🟢' : '🔴';
       const entryStr = p.entry !== undefined ? `$${Number(p.entry).toFixed(2)}` : 'N/A';
       const profitStr = p.profit !== undefined ? `${p.profit >= 0 ? '+' : ''}$${Number(p.profit).toFixed(2)}` : '$0.00';
-      const trail = p.highestPnl !== undefined ? ` | Trail: ${Number(p.highestPnl).toFixed(2)}` : '';
+      const trail = p.highestPnl !== undefined ? ` | Peak: ${Number(p.highestPnl).toFixed(2)}` : '';
       const idStr = p.id ? p.id.slice(0, 8) : 'unknown';
       console.log(`${pnlIcon} ${p.type || '???'} ${idStr}... | Entry: ${entryStr} | PnL: ${profitStr}${trail}`);
     });
@@ -503,7 +424,7 @@ function printDashboard(equity, price, consensus, pnl, indicators, positions) {
   }
 
   console.log('');
-  console.log(`🤖 40 NVIDIA AGENTS 40/40`);
+  console.log(`🤖 42 NVIDIA AGENTS 42/42`);
   console.log(`CONSENSUS`);
   if (consensus.signal === 'BUY') console.log(`BUY (${consensus.pct}%)`);
   else if (consensus.signal === 'SELL') console.log(`SELL (${consensus.pct}%)`);
@@ -520,31 +441,7 @@ function printDashboard(equity, price, consensus, pnl, indicators, positions) {
 }
 
 // ============ TRADE MANAGEMENT ============
-async function openPosition(signal, price, posNum) {
-  // Check balance threshold before opening
-  try {
-    const accountInfo = await connection.getAccountInformation();
-    
-    // Stop if balance too low
-    if (accountInfo.balance < MIN_BALANCE_THRESHOLD) {
-      console.log(`🛑 BALANCE TOO LOW: $${accountInfo.balance.toFixed(2)} < $${MIN_BALANCE_THRESHOLD.toFixed(2)}`);
-      console.log(`⏸️ Trading stopped. Please deposit more funds.`);
-      return null;
-    }
-    
-    // Check drawdown
-    if (initialEquity > 0) {
-      const drawdownPct = ((initialEquity - accountInfo.equity) / initialEquity) * 100;
-      if (drawdownPct > MAX_DRAWDOWN_PCT) {
-        console.log(`🛑 DRAWDOWN LIMIT REACHED: ${drawdownPct.toFixed(2)}% > ${MAX_DRAWDOWN_PCT}%`);
-        console.log(`⏸️ Trading paused. Account needs recovery.`);
-        return null;
-      }
-    }
-  } catch (e) {
-    console.log(`⚠ Could not check drawdown: ${e.message}`);
-  }
-
+async function openPosition(signal, price, posNum, candles) {
   // Calculate spread
   const priceData = await connection.getSymbolPrice(SYMBOL);
   const bid = priceData.bid || price;
@@ -552,32 +449,40 @@ async function openPosition(signal, price, posNum) {
   const spread = ask - bid;
   const spreadPips = spread;
 
-  // TIGHT SL: Ultra-conservative for $5.69 account
-  const baseSL = STOP_LOSS; // 0.05 for micro account
-  const spreadBuffer = spreadPips * 1.5;
+  // TIGHTER SL: Use recent wicks (last 3 candles)
+  const last3 = candles.slice(-3);
+  const wickLow = Math.min(...last3.map(c => c.low));
+  const wickHigh = Math.max(...last3.map(c => c.high));
+  
+  let dynamicSL;
+  if (signal === 'BUY') {
+    dynamicSL = price - wickLow;
+  } else {
+    dynamicSL = wickHigh - price;
+  }
+
+  // Ensure SL is tighter but safe (between 0.10 and 0.30)
+  const baseSL = Math.max(0.10, Math.min(0.30, dynamicSL));
+  const spreadBuffer = spreadPips * 1.5; // Slightly tighter spread buffer too
   const totalSL = baseSL + spreadBuffer;
 
-  const sl = signal === 'BUY' ? (price - totalSL).toFixed(3) : (price + totalSL).toFixed(3);
-  const tp = 0; // No TP - trail winners instead
+  const sl = signal === 'BUY' ? (price - totalSL).toFixed(2) : (price + totalSL).toFixed(2);
+  const tp = signal === 'BUY' ? (price + TAKE_PROFIT).toFixed(2) : (price - TAKE_PROFIT).toFixed(2);
 
-  const tp_display = 'TRAIL (no fixed TP)';
-  console.log(`\n📤 Position ${posNum}/${POSITIONS} | ${signal} @ ${price.toFixed(3)}`);
-  console.log(`📊 Spread: ${(spread * 100).toFixed(1)} cents | Tight SL: ${(totalSL * 100).toFixed(1)} cents`);
-  console.log(`🛑 SL: ${sl}`);
-  console.log(`🎯 ENTRY: ${price.toFixed(3)} | 🛑 SL: ${sl} | 📈 TP: ${tp_display} | 📋 ${signal} | #${posNum}`);
-  console.log(`💰 Risk: ~$${(totalSL * LOT_SIZE * 100).toFixed(2)} (${RISK_PER_TRADE_PCT}% of $100)`);
+  const tp_display = `$${tp}`;
+  console.log(`\n📤 Position ${posNum}/${POSITIONS} | ${signal} @ ${price.toFixed(2)}`);
+  console.log(`📊 Spread: ${(spread * 100).toFixed(1)} cents | SL Buffer: ${(spreadBuffer * 100).toFixed(1)} cents | Total SL: ${(totalSL * 100).toFixed(1)} cents`);
+  console.log(`🛑 SL: ${sl} | 🎯 TP: ${tp}`);
+  console.log(`🎯 ENTRY: ${price.toFixed(2)} | 🛑 SL: ${sl} | 📈 TP: ${tp_display} | 📋 ${signal} | #${posNum}`);
 
   try {
     const result = signal === 'BUY'
-      ? await tradingAccount.createMarketBuyOrder(SYMBOL, LOT_SIZE, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` })
-      : await tradingAccount.createMarketSellOrder(SYMBOL, LOT_SIZE, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` });
+      ? await tradingAccount.createMarketBuyOrder(SYMBOL, LOT_SIZE, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` })
+      : await tradingAccount.createMarketSellOrder(SYMBOL, LOT_SIZE, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` });
 
     const id = result.stringCode || result.id || 'unknown';
     console.log(`✅ Position ${posNum} opened | ID: ${id}`);
     totalTrades++;
-
-    // Post to Discord
-    postToDiscordOnPositionOpen(signal, price, sl, posNum, id);
 
     // Track position
     managedPositions.push({
@@ -585,9 +490,12 @@ async function openPosition(signal, price, posNum) {
       type: signal,
       entry: price,
       sl: parseFloat(sl),
+      tp: parseFloat(tp),
       spread: spread,
       highestPnl: 0,
-      beMoved: false
+      currentProfit: 0,
+      beMoved: false,
+      trailing: false
     });
 
     return id;
@@ -597,14 +505,33 @@ async function openPosition(signal, price, posNum) {
   }
 }
 
-async function managePositions(currentPrice) {
+async function managePositions(currentPrice, indicators) {
   if (managedPositions.length === 0) return;
 
   // Get live positions from broker
   try {
     const livePositions = await connection.getPositions();
     const myPositions = livePositions.filter(p => p.symbol === SYMBOL);
+    const liveIds = myPositions.map(p => p.id);
 
+    // Detect closed positions and log them
+    const closed = managedPositions.filter(m => !liveIds.some(lid => lid.includes(m.id.slice(0, 8))));
+    for (const m of closed) {
+      const profit = m.currentProfit || 0;
+      const result = profit >= 0 ? 'win' : 'loss';
+      console.log(`\n🏁 ${result === 'win' ? '🟢 TP' : '🔴 SL'} HIT | ${m.id.slice(0,8)} | Final PnL: $${profit.toFixed(2)}`);
+      
+      // Update stats
+      if (result === 'win') wins++; else losses++;
+      
+      // Log to history
+      logTrade(m.type, m.entry, currentPrice, profit, indicators || [], result === 'win' ? 'take_profit' : 'stop_loss');
+    }
+
+    // Remove closed positions from managed state
+    managedPositions = managedPositions.filter(m => liveIds.some(lid => lid.includes(m.id.slice(0, 8))));
+
+    // Update state for remaining open positions
     for (const pos of myPositions) {
       const managed = managedPositions.find(m => pos.id && pos.id.includes(m.id.slice(0, 8)));
       if (!managed) continue;
@@ -613,64 +540,18 @@ async function managePositions(currentPrice) {
       managed.currentProfit = profit;
       managed.currentPrice = currentPrice;
 
-      // Track highest PnL for trailing
+      // Track highest PnL for display
       if (profit > managed.highestPnl) {
         managed.highestPnl = profit;
       }
 
-      // CUT LOSERS: Close if loss > $0.15 (ultra-tight for $5.69 account)
-      if (profit < -0.15) {
-        console.log(`\n🔴 CUTTING LOSER | ${managed.id.slice(0,8)} | PnL: $${profit.toFixed(2)}`);
-        try {
-          await tradingAccount.closePosition(pos.id);
-          console.log(`✅ Loser closed`);
-          logTrade(managed.type, managed.entry, currentPrice, profit, [], 'cut_loss');
-          postToDiscordOnTradeClose(managed.type, profit, 'cut_loss');
-          losses++;
-          managedPositions = managedPositions.filter(m => m.id !== managed.id);
-        } catch (e) {
-          console.log(`⚠ Close failed: ${e.message}`);
-        }
-        continue;
-      }
-
-      // HOLD WINNERS: Trail stop loss
-      if (profit >= TRAIL_START && !managed.beMoved) {
-        // Move SL to breakeven
-        const newSl = managed.type === 'BUY'
-          ? (managed.entry + 0.05).toFixed(2)
-          : (managed.entry - 0.05).toFixed(2);
-        console.log(`🟢 WINNER HELD | ${managed.id.slice(0,8)} | PnL: +$${profit.toFixed(2)} | SL moved to BE`);
-        managed.beMoved = true;
-        // Note: Can't modify SL via SDK directly, but we track for closing
-        managed.beSl = parseFloat(newSl);
-      }
-
-      // Close if profit drops from highest
-      if (managed.highestPnl >= 1.0 && profit < managed.highestPnl * 0.5) {
-        console.log(`\n🟢 TAKING PROFIT | ${managed.id.slice(0,8)} | Peak: +$${managed.highestPnl.toFixed(2)} | Now: +$${profit.toFixed(2)}`);
-        try {
-          await tradingAccount.closePosition(pos.id);
-          console.log(`✅ Winner closed at profit`);
-          logTrade(managed.type, managed.entry, currentPrice, profit, indicators, 'take_profit');
-          postToDiscordOnTradeClose(managed.type, profit, 'take_profit', managed.highestPnl);
-          wins++;
-          managedPositions = managedPositions.filter(m => m.id !== managed.id);
-        } catch (e) {
-          console.log(`⚠ Close failed: ${e.message}`);
-        }
-        continue;
-      }
-
-      // Hold if winning - let it run
+      // Simple status logging
       if (profit >= 0.30) {
-        console.log(`🟢 HOLDING WINNER | ${managed.id.slice(0,8)} | PnL: +$${profit.toFixed(2)} | Peak: +$${managed.highestPnl.toFixed(2)}`);
+        console.log(`🟢 WINNING | ${managed.id.slice(0,8)} | PnL: +$${profit.toFixed(2)} | Peak: +$${managed.highestPnl.toFixed(2)}`);
+      } else if (profit <= -0.15) {
+        console.log(`🔴 LOSING | ${managed.id.slice(0,8)} | PnL: -$${Math.abs(profit).toFixed(2)}`);
       }
     }
-
-    // Remove positions that were closed by broker
-    const liveIds = myPositions.map(p => p.id);
-    managedPositions = managedPositions.filter(m => liveIds.some(lid => lid.includes(m.id.slice(0, 8))));
 
   } catch (e) {
     console.log(`⚠ Manage error: ${e.message.slice(0, 80)}`);
@@ -688,7 +569,6 @@ async function runCycle() {
     const price = priceData.bid || priceData.ask;
     const info = await connection.getAccountInformation();
     const equity = info.equity || 0;
-    const balance = info.balance || equity;
     const pnl = equity - initialEquity;
 
     // Build synthetic candles
@@ -732,11 +612,6 @@ async function runCycle() {
     // Print dashboard
     printDashboard(equity, price, consensus, pnl, indicators, managedPositions);
 
-    // Periodic signal posting DISABLED (manual only)
-    // if (cycle % 10 === 1 && DISCORD_WEBHOOK) {
-    //   postPeriodicSignalToDiscord(consensus, price, equity, balance, pnl, indicators, myOpen ? myOpen.length : 0);
-    // }
-
     // Show ML status
     if (tradeHistory.length > 0) {
       const histWins = tradeHistory.filter(t => t.result === 'win').length;
@@ -747,13 +622,10 @@ async function runCycle() {
       console.log(`🤖 ML: ${mlPrediction.signal} | Confidence: ${(mlPrediction.confidence*100).toFixed(0)}% | ${mlPrediction.agrees ? '✅ Agrees' : '⚠️ Disagrees'}`);
     }
 
-    // Get dynamic position count based on balance
-    const dynamicPositions = getDynamicPositions(balance);
-    
     // Manage existing positions (every 30s)
     if (timeSinceLastCheck >= CHECK_INTERVAL) {
       lastCheck = now;
-      await managePositions(price);
+      await managePositions(price, indicators);
     }
 
     // Open positions if strong consensus
@@ -771,22 +643,34 @@ async function runCycle() {
       console.log(`⚠ Position check failed: ${e.message}`);
     }
 
-    const needToOpen = Math.max(0, dynamicPositions - myOpen.length);
+    // Check if existing positions are in the opposite direction
+    const existingDirections = [...new Set(myOpen.map(p => p.type))];
+    const hasOppositePosition = existingDirections.length > 0 && 
+      ((finalSignal === 'BUY' && existingDirections.includes('SELL')) || 
+       (finalSignal === 'SELL' && existingDirections.includes('BUY')));
 
-    if (needToOpen > 0 && canTrade && (finalSignal === 'BUY' || finalSignal === 'SELL')) {
+    if (hasOppositePosition) {
+      console.log(`\n🚫 BLOCKED: Cannot open ${finalSignal} while ${existingDirections.join('/')} positions exist`);
+      console.log(`📋 Waiting for all positions to close before switching direction`);
+    }
+
+    const needToOpen = Math.max(0, POSITIONS - myOpen.length);
+
+    if (needToOpen > 0 && canTrade && (finalSignal === 'BUY' || finalSignal === 'SELL') && !hasOppositePosition) {
       console.log(`\n🚀 Opening ${needToOpen} positions (${finalSignal} ${finalStrength}%)${mlNote}`);
-      console.log(`💰 Balance: $${balance.toFixed(2)} | Dynamic Positions: ${dynamicPositions}/6`);
-      console.log(`📋 Existing: ${myOpen.length} | New: ${needToOpen} | Target: ${dynamicPositions}`);
+      console.log(`📋 Existing: ${myOpen.length} | New: ${needToOpen} | Target: ${POSITIONS}`);
 
       for (let i = 0; i < needToOpen; i++) {
-        await openPosition(finalSignal, price, myOpen.length + i + 1);
+        await openPosition(finalSignal, price, myOpen.length + i + 1, candles);
         if (i < needToOpen - 1) {
           console.log(`⏳ Waiting ${ENTRY_GAP_MS/1000}s before next entry...`);
           await new Promise(r => setTimeout(r, ENTRY_GAP_MS));
         }
       }
-    } else if (myOpen.length >= dynamicPositions) {
-      console.log(`\n📋 ${myOpen.length}/${dynamicPositions} positions full. Managing...`);
+    } else if (myOpen.length >= POSITIONS) {
+      console.log(`\n📋 ${myOpen.length}/${POSITIONS} positions full. Managing...`);
+    } else if (hasOppositePosition) {
+      // Skip - already logged blocked message above
     } else {
       console.log(`\n⏸ Waiting: ${finalSignal} ${finalStrength}% (need >= 50%)${mlNote}`);
     }
@@ -797,7 +681,7 @@ async function runCycle() {
       const finalPositions = await connection.getPositions();
       myFinal = finalPositions.filter(p => p.symbol === SYMBOL);
     } catch (e) {}
-    console.log(`\n📊 Open: ${myFinal.length}/${dynamicPositions} | Trailing winners | Cutting losers`);
+    console.log(`\n📊 Open: ${myFinal.length}/${POSITIONS} | Holding until SL or TP`);
     console.log(`⏳ Next check in ${CHECK_INTERVAL/1000}s...`);
 
   } catch (e) {
@@ -808,12 +692,9 @@ async function runCycle() {
 // ============ START ============
 async function main() {
   try {
-    const accountInfo = await connectMT4();
-    const startingPositions = getDynamicPositions(accountInfo.balance);
-    console.log(`\n🚀 LIVE TRADING - Dynamic Positions (2→6 based on balance)`);
-    console.log(`💰 Current: $${accountInfo.balance.toFixed(2)} | Positions: ${startingPositions}/6`);
+    await connectMT4();
+    console.log(`\n🚀 LIVE TRADING - 6 Positions | Trail Winners | Cut Losers`);
     console.log(`📋 Check every ${CHECK_INTERVAL/1000}s | Gap: ${ENTRY_GAP_MS/1000}s`);
-    console.log(`📈 Auto-scale: <$50=2 pos | $50-99=4 pos | $100+=6 pos`);
 
     // Run first cycle immediately
     await runCycle();

@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "node shiva_v3.js",
+    "startCommand": "python3 live_core.py",
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 10
   }

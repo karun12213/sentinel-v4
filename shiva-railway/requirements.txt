@@ -1,1 +1,5 @@
-requests
+metaapi-cloud-sdk
+pandas
+pandas_ta
+python-dotenv
+numpy
