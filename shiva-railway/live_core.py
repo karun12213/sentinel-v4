@@ -340,13 +340,11 @@ class MetaController:
         total_weight   = sum(w for _, _, w in votes)
         normalized     = weighted_sum / total_weight if total_weight else 0
 
-        if normalized > self.SIGNAL_THRESHOLD:
+        if normalized >= 0:
             agree = '+'.join(n for n, sig, _ in votes if sig == 1)
             return 1, agree
-        if normalized < -self.SIGNAL_THRESHOLD:
-            agree = '+'.join(n for n, sig, _ in votes if sig == -1)
-            return -1, agree
-        return 0, ''
+        agree = '+'.join(n for n, sig, _ in votes if sig == -1)
+        return -1, agree
 
     def report(self):
         now = time.time()
