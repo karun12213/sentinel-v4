@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * SHIVA LIVE TRADING BOT - MT4/SpotCrude
- * 40 NVIDIA Agents | Opens 6 positions | Trail winners | Cut losers
+ * 40 NVIDIA Agents | Opens 6 positions | Hold until SL/TP
  */
 
 const MetaApi = require('metaapi.cloud-sdk').default;
@@ -35,16 +35,18 @@ function loadEnvFile() {
 }
 loadEnvFile();
 
-const TOKEN = process.env.METAAPI_TOKEN || '';
-const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID || '';
-const SYMBOL = 'SpotCrude';
-const LOT_SIZE = 0.03;
-const POSITIONS = 6;
+const TOKEN = (process.env.METAAPI_TOKEN || '').trim();
+const ACCOUNT_ID = (process.env.METAAPI_ACCOUNT_ID || '').trim();
+const SYMBOL = process.env.SYMBOL || 'SpotCrude';
+const parsedLotSize = parseFloat(process.env.LOT_SIZE || '');
+const LOT_SIZE = Number.isFinite(parsedLotSize) && parsedLotSize > 0 ? parsedLotSize : 0.01;
+const parsedPositions = Number.parseInt(process.env.POSITIONS ?? '6', 10);
+const POSITIONS = Number.isNaN(parsedPositions) ? 6 : parsedPositions;
 const ENTRY_GAP_MS = 3000;
-const STOP_LOSS = 0.30;
-const TAKE_PROFIT = 0.60;
-const CHECK_INTERVAL = 30000;
-const MAX_TRADES_PER_CYCLE = 6;
+const STOP_LOSS = parseFloat(process.env.STOP_LOSS) || 0.30;
+const TAKE_PROFIT = parseFloat(process.env.TAKE_PROFIT) || 0.60;
+const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 60000;
+const MAX_TRADES_PER_CYCLE = POSITIONS;
 const ML_RETRAIN_INTERVAL = 5; // Retrain ML every 5 cycles
 
 // ============ STATE ============
@@ -461,8 +463,8 @@ async function openPosition(signal, price, posNum, candles) {
     dynamicSL = wickHigh - price;
   }
 
-  // Ensure SL is tighter but safe (between 0.10 and 0.30)
-  const baseSL = Math.max(0.10, Math.min(0.30, dynamicSL));
+  // Ensure SL is tighter but safe (between 0.05 and 0.35)
+  const baseSL = Math.max(0.05, Math.min(0.35, dynamicSL));
   const spreadBuffer = spreadPips * 1.5; // Slightly tighter spread buffer too
   const totalSL = baseSL + spreadBuffer;
 
@@ -691,19 +693,27 @@ async function runCycle() {
 
 // ============ START ============
 async function main() {
-  try {
-    await connectMT4();
-    console.log(`\n🚀 LIVE TRADING - 6 Positions | Trail Winners | Cut Losers`);
-    console.log(`📋 Check every ${CHECK_INTERVAL/1000}s | Gap: ${ENTRY_GAP_MS/1000}s`);
+  while (true) {
+    try {
+      console.log('🚀 Starting SHIVA Bot...');
+      await connectMT4();
+      console.log(`\n🚀 LIVE TRADING - 6 Positions | Trail Winners | Cut Losers`);
+      console.log(`📋 Check every ${CHECK_INTERVAL/1000}s | Gap: ${ENTRY_GAP_MS/1000}s`);
 
-    // Run first cycle immediately
-    await runCycle();
+      // Run first cycle immediately
+      await runCycle();
 
-    // Then run on interval
-    setInterval(runCycle, CHECK_INTERVAL);
-  } catch (e) {
-    console.log(`❌ Fatal: ${e.message}\n${e.stack}`);
-    process.exit(1);
+      // Then run on interval
+      // Using a promise-based loop instead of setInterval for better error handling
+      while (true) {
+        await new Promise(r => setTimeout(r, CHECK_INTERVAL));
+        await runCycle();
+      }
+    } catch (e) {
+      console.log(`❌ Fatal Error in Main Loop: ${e.message}`);
+      console.log(`⏳ Restarting in 30 seconds...`);
+      await new Promise(r => setTimeout(r, 30000));
+    }
   }
 }
 

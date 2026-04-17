@@ -710,14 +710,17 @@ class ExecutionEngine:
 
                 except Exception as e:
                     msg = str(e)
-                    print(f"⚠️  Loop warning: {msg}")
-                    if 'Market is closed' in msg:
+                    print(f"⚠️  Loop warning: {msg[:200]}")
+                    if 'cpu credits' in msg or 'rate' in msg.lower() or '429' in msg:
+                        print("🚦 Rate limited — waiting 10 minutes before retry")
+                        await asyncio.sleep(600)
+                    elif 'Market is closed' in msg:
                         await asyncio.sleep(300)
                     elif 'Invalid stops' in msg:
                         await self._refresh_spec()
                         await asyncio.sleep(120)
                     else:
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(60)
 
         except Exception as e:
             print(f"❌ Fatal: {e}")
