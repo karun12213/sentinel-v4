@@ -129,8 +129,8 @@ class FeatureEngine:
 # BASE STRATEGY
 # ─────────────────────────────────────────────
 class BaseStrategy(ABC):
-    MIN_TRADES = 20           # minimum trades before auto-disable check
-    DISABLE_WR  = 0.35        # disable if win rate falls below this
+    MIN_TRADES = 999999       # effectively never auto-disable
+    DISABLE_WR  = 0.0         # no auto-disable
 
     def __init__(self, name: str):
         self.name    = name
@@ -200,11 +200,9 @@ class TrendStrategy(BaseStrategy):
 
     def generate_signal(self, df: pd.DataFrame) -> int:
         r = df.iloc[-1]
-        if r['EMA_50'] > r['EMA_200'] and r['close'] > r['EMA_20']:
+        if r['close'] > r['EMA_20']:
             return 1
-        if r['EMA_50'] < r['EMA_200'] and r['close'] < r['EMA_20']:
-            return -1
-        return 0
+        return -1
 
 
 # ─────────────────────────────────────────────
@@ -216,11 +214,9 @@ class ReversionStrategy(BaseStrategy):
 
     def generate_signal(self, df: pd.DataFrame) -> int:
         rsi = df.iloc[-1].get('RSI', 50) or 50
-        if rsi < 40:
-            return 1   # Oversold → BUY
-        if rsi > 60:
-            return -1  # Overbought → SELL
-        return 0
+        if rsi <= 50:
+            return 1   # Below midpoint → BUY
+        return -1      # Above midpoint → SELL
 
 
 # ─────────────────────────────────────────────
@@ -321,7 +317,7 @@ class MetaController:
     Combines signals from all active strategies via weighted voting.
     Periodically prints a strategy status table.
     """
-    SIGNAL_THRESHOLD = 0.10   # weighted-average must exceed this
+    SIGNAL_THRESHOLD = 0.0    # any signal fires
 
     def __init__(self, strategies: list[BaseStrategy]):
         self.strategies  = strategies
@@ -498,7 +494,7 @@ class ExecutionEngine:
         self.tracked: dict[str, str] = {}
         # Cooldown: block new entries for 6 min after a position closes
         self.last_close_time: float = 0.0
-        self.COOLDOWN_SECS: int = 0  # no cooldown — re-enter immediately
+        self.COOLDOWN_SECS: int = 0  # re-enter immediately after close
 
     def stop(self, *_):
         self.is_running = False
