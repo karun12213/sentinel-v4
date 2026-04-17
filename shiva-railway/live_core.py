@@ -635,7 +635,7 @@ class ExecutionEngine:
             while self.is_running:
                 try:
                     # ── 1. Fetch candles and indicators ──
-                    candles = await self.account.get_historical_candles(self.symbol, '15m', limit=500)
+                    candles = await self.connection.get_historical_candles(self.symbol, '15m', limit=500)
                     df = FeatureEngine.add_indicators(pd.DataFrame(candles))
                     if df.empty:
                         raise RuntimeError('Indicator frame empty after preprocessing')
