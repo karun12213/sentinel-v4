@@ -18,11 +18,73 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import urllib.request
+import urllib.error
+
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from dotenv import load_dotenv
 from metaapi_cloud_sdk import MetaApi
+
+
+# ─────────────────────────────────────────────
+# DISCORD
+# ─────────────────────────────────────────────
+def _discord_post(webhook_url: str, payload: dict):
+    if not webhook_url:
+        return
+    try:
+        data = json.dumps(payload).encode()
+        req  = urllib.request.Request(
+            webhook_url, data=data,
+            headers={'Content-Type': 'application/json'}, method='POST'
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"⚠️  Discord post failed: {e}")
+
+
+def discord_trade_open(side: str, symbol: str, entry: float,
+                       sl: float, tp: float, lot: float, zone: str, wick: float):
+    webhook = os.getenv('DISCORD_TRADES') or os.getenv('DISCORD_ALERTS', '')
+    risk    = abs(entry - sl)
+    reward  = abs(tp - entry)
+    emoji   = '🚀' if side == 'BUY' else '📉'
+    color   = 0x00FF88 if side == 'BUY' else 0xFF4444
+    _discord_post(webhook, {"embeds": [{"title": f"{emoji} {side}  {symbol}",
+        "color": color,
+        "fields": [
+            {"name": "Entry",   "value": f"`{entry:.2f}`",  "inline": True},
+            {"name": "SL",      "value": f"`{sl:.2f}`",     "inline": True},
+            {"name": "TP",      "value": f"`{tp:.2f}`",     "inline": True},
+            {"name": "Risk",    "value": f"`{risk:.2f}`",   "inline": True},
+            {"name": "Reward",  "value": f"`{reward:.2f}`", "inline": True},
+            {"name": "R:R",     "value": f"`1 : {reward/risk:.1f}`" if risk else "`—`", "inline": True},
+            {"name": "Lot",     "value": f"`{lot}`",        "inline": True},
+            {"name": "Zone",    "value": f"`{zone}`",       "inline": True},
+            {"name": "Wick SL", "value": f"`{wick:.2f}`",  "inline": True},
+        ],
+        "footer": {"text": "SHIVA V5 — IFVG SMC"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }]})
+
+
+def discord_trade_close(side: str, symbol: str, entry: float,
+                        exit_price: float, pnl: float):
+    webhook = os.getenv('DISCORD_TRADES') or os.getenv('DISCORD_ALERTS', '')
+    result  = 'WIN ✅' if pnl > 0 else 'LOSS ❌'
+    color   = 0x00FF88 if pnl > 0 else 0xFF4444
+    _discord_post(webhook, {"embeds": [{"title": f"{result}  {symbol}  {side}",
+        "color": color,
+        "fields": [
+            {"name": "Entry",  "value": f"`{entry:.2f}`",      "inline": True},
+            {"name": "Exit",   "value": f"`{exit_price:.2f}`", "inline": True},
+            {"name": "PnL",    "value": f"`${pnl:.2f}`",       "inline": True},
+        ],
+        "footer": {"text": "SHIVA V5 — IFVG SMC"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }]})
 
 # ─────────────────────────────────────────────
 # HEALTH SERVER
@@ -512,6 +574,12 @@ class ExecutionEngine:
                 f"📊 Position closed | {result} | PnL=${pnl:.2f} | "
                 f"Cooldown: next entry in {self.COOLDOWN_SECS // 60} min"
             )
+            # Find entry price from analytics for Discord close message
+            rec = next((r for r in self.analytics.records
+                        if r['position_id'] == pos_id), None)
+            entry_price = rec['entry'] if rec else 0.0
+            side        = rec['side']  if rec else '?'
+            discord_trade_close(side, self.symbol, entry_price, exit_price, pnl)
 
         self.meta.report()
 
@@ -611,10 +679,12 @@ class ExecutionEngine:
                         )
                         if new_pos:
                             side = 'BUY' if signal == 1 else 'SELL'
+                            zone = "DISCOUNT" if signal == 1 else "PREMIUM"
                             self.tracked[new_pos['id']] = self.ifvg_strategy.name
                             self.analytics.log_open(
                                 new_pos['id'], side, entry, sl, tp, lot, self.ifvg_strategy.name
                             )
+                            discord_trade_open(side, self.symbol, entry, sl, tp, lot, zone, wick)
 
                     await asyncio.sleep(60)
 
