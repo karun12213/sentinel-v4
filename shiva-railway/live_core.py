@@ -886,7 +886,7 @@ class ExecutionEngine:
             return  # already fresh for today
         try:
             start = datetime.now(timezone.utc) - timedelta(days=300)
-            candles = await self.account.get_historical_candles(self.symbol, '1day', start, 220)
+            candles = await self.account.get_historical_candles(self.symbol, '1d', start, 220)
             if candles and len(candles) >= 200:
                 closes = pd.Series([c['close'] for c in candles])
                 ema = ta.ema(closes, length=200)
