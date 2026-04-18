@@ -2,11 +2,14 @@
 SHIVA V6 — IFVG + FVG Scalp | Fixed SL/TP | Dynamic Lot | Max 9 trades/day
 Entry: Fresh FVG zone retests + EMA20 bounce
 SL: Fixed 0.30pt ($3 at 0.01 lot)  TP: Fixed 1.80pt ($18 at 0.01 lot)  RR: 1:6
-Lot scaling every $300 of balance:
-  $100-$299 → 0.01 lot  ($3 SL / $18 TP)
-  $300-$599 → 0.03 lot  ($9 SL / $54 TP)
-  $600-$899 → 0.06 lot  ($18 SL / $108 TP)
-  $900+     → 0.09+     (scales linearly)
+Lot scaling every $100 of balance (aggressive compounding toward $500/week):
+  $100-$199 → 0.01 lot  ($3 SL  / $18 TP)
+  $200-$299 → 0.02 lot  ($6 SL  / $36 TP)
+  $300-$399 → 0.03 lot  ($9 SL  / $54 TP)
+  $1000+    → 0.10 lot  ($30 SL / $180 TP)
+  $3000+    → 0.30 lot  ($90 SL / $540 TP) ← ~$500/week target
+  Max: 1.00 lot
+Circuit breaker: 3 consecutive losses in a day → pause until next day
 Daily limit: MAX_DAILY_TRADES (default 9)
 """
 import asyncio
@@ -136,20 +139,16 @@ def require_env(name):
 # DYNAMIC LOT SIZING
 # ─────────────────────────────────────────────
 def compute_lot_size(capital: float,
-                     base_capital: float = 100.0,
-                     step: float = 300.0,
-                     base_lot: float = 0.01) -> float:
+                     step: float = 100.0,
+                     base_lot: float = 0.01,
+                     max_lot: float = 1.0) -> float:
     """
-    Scales lot size proportionally every $300 of capital:
-      $100–$299 → 0.01   $300–$599 → 0.03
-      $600–$899 → 0.06   $900–$1199 → 0.09  etc.
-    Formula: lot = max(base_lot, floor(capital / step) * (step / base_capital * base_lot))
+    Scales lot by $100 tiers — aggressive compounding toward $500/week.
+      $100 → 0.01  $200 → 0.02  $300 → 0.03  $1000 → 0.10  $3000 → 0.30
     """
-    if capital < step:
-        return base_lot
-    tier = int(capital // step)
-    lot  = round(tier * (step / base_capital) * base_lot, 2)
-    return max(base_lot, lot)
+    tier = max(1, int(capital // step))
+    lot  = round(tier * base_lot, 2)
+    return min(lot, max_lot)
 
 
 # ─────────────────────────────────────────────
@@ -683,10 +682,13 @@ class ExecutionEngine:
         self.tracked: dict[str, str] = {}
         self.last_close_time: float  = 0.0
 
-        # Daily trade counter
-        self.max_daily_trades = int(os.getenv('MAX_DAILY_TRADES', '9'))
-        self.daily_trades     = 0
-        self.daily_reset_date = datetime.now(timezone.utc).date()
+        # Daily trade counter + circuit breaker
+        self.max_daily_trades   = int(os.getenv('MAX_DAILY_TRADES', '9'))
+        self.daily_trades       = 0
+        self.daily_reset_date   = datetime.now(timezone.utc).date()
+        self.consec_losses      = 0
+        self.circuit_broken     = False   # 3 consec losses → pause rest of day
+        self.max_consec_losses  = int(os.getenv('MAX_CONSEC_LOSSES', '3'))
 
     def stop(self, *_):
         self.is_running = False
@@ -696,8 +698,10 @@ class ExecutionEngine:
         today = datetime.now(timezone.utc).date()
         if today != self.daily_reset_date:
             print(f"📅 New trading day ({today}) — daily counter reset (was {self.daily_trades} trades)")
-            self.daily_trades     = 0
+            self.daily_trades   = 0
             self.daily_reset_date = today
+            self.consec_losses  = 0
+            self.circuit_broken = False
 
     # ── broker helpers ──
 
@@ -820,8 +824,19 @@ class ExecutionEngine:
             self.analytics.log_close(pos_id, exit_price, pnl)
             self.last_close_time = time.time()
             result = "WIN ✅" if pnl > 0 else "LOSS ❌"
+
+            # Circuit breaker tracking
+            if pnl > 0:
+                self.consec_losses = 0
+            else:
+                self.consec_losses += 1
+                if self.consec_losses >= self.max_consec_losses:
+                    self.circuit_broken = True
+                    print(f"⚡ CIRCUIT BREAKER: {self.consec_losses} consecutive losses — pausing for today")
+
             print(
                 f"📊 Position closed | {result} | PnL=${pnl:.2f} | "
+                f"ConsecLoss={self.consec_losses} | "
                 f"Daily: {self.daily_trades}/{self.max_daily_trades} | "
                 f"Cooldown: {self.COOLDOWN_SECS // 60} min"
             )
@@ -896,6 +911,12 @@ class ExecutionEngine:
                     # Daily limit check
                     if self.daily_trades >= self.max_daily_trades:
                         print(f"🚫 Daily limit reached ({self.daily_trades}/{self.max_daily_trades}) — waiting for next day")
+                        await asyncio.sleep(300)
+                        continue
+
+                    # Circuit breaker: 3 consecutive losses → pause rest of day
+                    if self.circuit_broken:
+                        print(f"⚡ Circuit breaker active ({self.consec_losses} consec losses) — resuming tomorrow")
                         await asyncio.sleep(300)
                         continue
 

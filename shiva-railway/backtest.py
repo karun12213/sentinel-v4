@@ -7,11 +7,12 @@ Data: CL=F (WTI Crude / USOIL proxy)
 Fixed SL/TP (price pts):
   SL = 0.30 pt   TP = 1.80 pt  (1:6 RR)
 
-Dynamic lot every $300 of capital:
+Dynamic lot every $100 of capital (aggressive compounding → $500/week):
   $100 → 0.01 lot  ($3 SL  / $18 TP)
+  $200 → 0.02 lot  ($6 SL  / $36 TP)
   $300 → 0.03 lot  ($9 SL  / $54 TP)
-  $600 → 0.06 lot  ($18 SL / $108 TP)
-  $900 → 0.09 lot  ($27 SL / $162 TP)
+  $1000 → 0.10 lot ($30 SL / $180 TP)
+  $1400+ → $500+/week target
 
 Capital: $100  |  0.01 lot base  |  Max 9 trades/day
 """
@@ -101,14 +102,17 @@ def run(df: pd.DataFrame, label: str,
         return pd.DataFrame()
 
     strategies = strategy_list if strategy_list is not None else [FVGScalpStrategy(), EMABounceStrategy()]
-    warmup       = 215   # EMA-200 + indicators need ~200 bars
+    warmup          = 215   # EMA-200 + indicators need ~200 bars
+    max_consec_loss = 3     # circuit breaker threshold
 
-    trades        = []
-    capital       = initial_capital
-    equity_curve  = [initial_capital]
-    position      = None
-    last_close_bar = -9999
-    daily_counts  = defaultdict(int)
+    trades          = []
+    capital         = initial_capital
+    equity_curve    = [initial_capital]
+    position        = None
+    last_close_bar  = -9999
+    daily_counts    = defaultdict(int)
+    daily_consec    = defaultdict(int)   # consecutive losses per day
+    daily_broken    = set()              # days where circuit breaker fired
 
     for i in range(warmup, len(df)):
         bar  = df.iloc[i]
@@ -164,11 +168,21 @@ def run(df: pd.DataFrame, label: str,
                 last_close_bar = i
                 position = None
 
+                # Circuit breaker tracking
+                if pnl_val > 0:
+                    daily_consec[date] = 0
+                else:
+                    daily_consec[date] += 1
+                    if daily_consec[date] >= max_consec_loss:
+                        daily_broken.add(date)
+
         equity_curve.append(capital)
 
         # ── New entry ──
         if position is None and (i - last_close_bar) >= cooldown_bars:
             if daily_counts[date] >= max_daily_trades:
+                continue
+            if date in daily_broken:          # circuit breaker — sit out rest of day
                 continue
 
             window = df.iloc[:i + 1].copy()
@@ -260,7 +274,7 @@ def run(df: pd.DataFrame, label: str,
     # ── Summary ──
     print(f"\n{'='*70}")
     print(f"  BACKTEST  |  {label}")
-    print(f"  SL={sl_pts}pt  TP={tp_pts}pt  RR=1:{tp_pts/sl_pts:.0f}  |  Dynamic lot $300 steps")
+    print(f"  SL={sl_pts}pt  TP={tp_pts}pt  RR=1:{tp_pts/sl_pts:.0f}  |  Dynamic lot $100 steps  |  Circuit breaker: {max_consec_loss} consec losses")
     print(f"  Capital ${initial_capital}  |  Max {max_daily_trades} trades/day")
     print(f"{'='*70}")
     if trades_df.empty:
@@ -351,6 +365,44 @@ def run(df: pd.DataFrame, label: str,
 
 
 # ─────────────────────────────────────────────
+# PROJECTION: weeks to $500/week
+# ─────────────────────────────────────────────
+def project_to_500_per_week(ev_per_trade: float, trades_per_week: float,
+                             initial_capital: float = 100.0,
+                             target_weekly: float = 500.0,
+                             max_weeks: int = 52):
+    """
+    Simulate week-by-week compounding with dynamic lot scaling every $100.
+    ev_per_trade: expected P&L per trade at 0.01 lot (base)
+    trades_per_week: estimated signal frequency per week
+    """
+    print("\n" + "=" * 70)
+    print("  PROJECTION — Compounding to $500/week")
+    print(f"  EV/trade @ 0.01 lot: ${ev_per_trade:.2f}  |  Trades/week: {trades_per_week:.1f}")
+    print("=" * 70)
+    print(f"  {'Week':>4}  {'Capital':>10}  {'Lot':>6}  {'Weekly P&L':>12}  {'Status'}")
+    print(f"  {'-'*55}")
+
+    cap = initial_capital
+    for week in range(1, max_weeks + 1):
+        lot     = compute_lot_size(cap)
+        scale   = lot / 0.01
+        weekly  = ev_per_trade * scale * trades_per_week
+        cap    += weekly
+        cap     = max(cap, 1.0)
+        status  = ''
+        if weekly >= target_weekly and not status:
+            status = f'  ← 🎯 $500/week reached at week {week}!'
+        print(f"  {week:>4}  ${cap:>9,.0f}  {lot:>6.2f}  ${weekly:>+11,.0f}{status}")
+        if weekly >= target_weekly:
+            print(f"\n  ✅ TARGET REACHED: week {week} | capital ${cap:,.0f} | weekly ${weekly:,.0f}")
+            break
+    else:
+        print(f"\n  Final: week {max_weeks} | capital ${cap:,.0f} | weekly ${ev_per_trade * compute_lot_size(cap)/0.01 * trades_per_week:,.0f}")
+    print("=" * 70)
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
@@ -433,3 +485,21 @@ if __name__ == '__main__':
         print(f"\n📝 15m trade log → backtest_15m_trades.csv  ({len(trades_15)} trades)")
         print("\n─── ALL 15M TRADES ─────────────────────────────────────────────────────────")
         print(trades_15[cols].to_string(index=False))
+
+    # ── Projection: when does $500/week become achievable? ──
+    if not trades_15.empty:
+        n15   = len(trades_15)
+        days15 = trades_15['date'].nunique()
+        weeks15 = max(days15 / 5, 1)
+        tpw_15m = n15 / weeks15                      # trades/week on 15m
+        tpw_5m  = tpw_15m * 3.0                      # ~3× denser on live 5m
+        ev_per  = trades_15['pnl'].sum() / n15 / (trades_15['lot'].iloc[0] / 0.01)
+
+        print(f"\n📈 15m observed: {tpw_15m:.1f} trades/week  |  EV/trade @ 0.01 lot: ${ev_per:.2f}")
+        print(f"   Live 5m estimate: ~{tpw_5m:.1f} trades/week (3× denser candles)")
+
+        print("\n── Conservative (15m rate, observed EV) ──")
+        project_to_500_per_week(ev_per, tpw_15m)
+
+        print("\n── Live bot estimate (5m rate, same EV) ──")
+        project_to_500_per_week(ev_per, tpw_5m)
