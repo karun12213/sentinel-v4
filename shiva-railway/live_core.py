@@ -1,6 +1,9 @@
 """
-SHIVA V5 — Multi-Strategy Autonomous USOIL Trading System
-Architecture: Multi-Agent Strategies → Meta Controller → Execution Engine
+SHIVA V5 — SMC IFVG Trading System
+Entry: Inverse Fair Value Gap retests in Discount / Premium zones
+SL: IFVG zone boundary (wick level)
+TP: 6R
+Cooldown: 6 minutes after any SL/TP hit before next entry
 """
 import asyncio
 import json
@@ -22,29 +25,10 @@ from dotenv import load_dotenv
 from metaapi_cloud_sdk import MetaApi
 
 # ─────────────────────────────────────────────
-# KRONOS AI (optional — set KRONOS_ENABLED=true)
-# ─────────────────────────────────────────────
-KRONOS_AVAILABLE = False
-KronosPredictor = None
-KronosTokenizer = None
-Kronos = None
-
-if os.getenv('KRONOS_ENABLED', '').lower() == 'true':
-    try:
-        _kronos_path = str(Path(__file__).parent.parent / 'lib' / 'kronos' / 'repo')
-        if _kronos_path not in sys.path:
-            sys.path.insert(0, _kronos_path)
-        from model import Kronos, KronosTokenizer, KronosPredictor  # noqa: F811
-        KRONOS_AVAILABLE = True
-        print("✅ Kronos model library imported")
-    except Exception as _e:
-        print(f"⚠️  Kronos import failed ({_e}). Running without AI layer.")
-
-# ─────────────────────────────────────────────
 # HEALTH SERVER
 # ─────────────────────────────────────────────
 class _HealthHandler(BaseHTTPRequestHandler):
-    _analytics_ref = None  # set by start_health_server
+    _analytics_ref = None
 
     def do_GET(self):
         if self.path == '/status' and self._analytics_ref:
@@ -88,13 +72,18 @@ class FeatureEngine:
     @staticmethod
     def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df['RSI']     = ta.rsi(df['close'], length=14)
-        df['ATR']     = ta.atr(df['high'], df['low'], df['close'], length=14)
+        # Normalise column names (MetaApi may return camelCase)
+        df.columns = [c.lower() for c in df.columns]
+        for alias, canon in [('tickvolume', 'volume'), ('brokertime', 'time')]:
+            if alias in df.columns and canon not in df.columns:
+                df.rename(columns={alias: canon}, inplace=True)
+
+        df['RSI'] = ta.rsi(df['close'], length=14)
+        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         df['EMA_20']  = ta.ema(df['close'], length=20)
         df['EMA_50']  = ta.ema(df['close'], length=50)
         df['EMA_200'] = ta.ema(df['close'], length=200)
 
-        # Bollinger Bands — detect actual column names at runtime
         try:
             bb = ta.bbands(df['close'], length=20, std=2)
             if bb is not None and not bb.empty:
@@ -107,21 +96,7 @@ class FeatureEngine:
         except Exception:
             pass
 
-        # MACD — detect actual column names at runtime
-        try:
-            macd = ta.macd(df['close'])
-            if macd is not None and not macd.empty:
-                mc = next((c for c in macd.columns if 'MACDh' in c), None)
-                ms = next((c for c in macd.columns if 'MACDs' in c), None)
-                mv = next((c for c in macd.columns if c.startswith('MACD') and 'h' not in c and 's' not in c), None)
-                if mv: df['MACD']      = macd[mv].values
-                if ms: df['MACD_sig']  = macd[ms].values
-                if mc: df['MACD_hist'] = macd[mc].values
-        except Exception:
-            pass
-
-        # Only require the core columns to be non-NaN (EMA_200 needs 200 bars)
-        core = ['RSI', 'ATR', 'EMA_20', 'EMA_50', 'EMA_200']
+        core = ['RSI', 'ATR', 'EMA_20', 'EMA_50']
         return df.dropna(subset=core)
 
 
@@ -129,23 +104,19 @@ class FeatureEngine:
 # BASE STRATEGY
 # ─────────────────────────────────────────────
 class BaseStrategy(ABC):
-    MIN_TRADES = 999999       # effectively never auto-disable
-    DISABLE_WR  = 0.0         # no auto-disable
+    MIN_TRADES = 999999
+    DISABLE_WR  = 0.0
 
     def __init__(self, name: str):
         self.name    = name
         self.enabled = True
         self.trades: list[dict] = []
 
-    # ── performance properties ──
     @property
     def n_trades(self): return len(self.trades)
 
     @property
     def wins(self): return sum(1 for t in self.trades if t['pnl'] > 0)
-
-    @property
-    def losses(self): return sum(1 for t in self.trades if t['pnl'] <= 0)
 
     @property
     def win_rate(self):
@@ -161,29 +132,19 @@ class BaseStrategy(ABC):
     def net_pnl(self): return sum(t['pnl'] for t in self.trades)
 
     @property
-    def weight(self):
-        """Signal weight: scales with recent win rate (0.1 – 2.0)."""
-        if self.n_trades < 5:
-            return 1.0
-        recent_wr = sum(1 for t in self.trades[-10:] if t['pnl'] > 0) / min(10, self.n_trades)
-        return round(max(0.1, recent_wr * 2), 3)
+    def weight(self): return 1.0
 
-    # ── attribution ──
     def record_trade(self, pnl: float):
         self.trades.append({'pnl': pnl, 'time': datetime.now(timezone.utc).isoformat()})
-        if self.n_trades >= self.MIN_TRADES and self.win_rate < self.DISABLE_WR:
-            self.enabled = False
-            print(f"⛔  {self.name} auto-disabled  WR={self.win_rate:.1%}  PF={self.profit_factor:.2f}")
 
     def status(self) -> dict:
         return {
-            'strategy':       self.name,
-            'enabled':        self.enabled,
-            'trades':         self.n_trades,
-            'win_rate':       f"{self.win_rate:.1%}",
-            'profit_factor':  f"{self.profit_factor:.2f}",
-            'net_pnl':        f"${self.net_pnl:.2f}",
-            'weight':         self.weight,
+            'strategy':      self.name,
+            'enabled':       self.enabled,
+            'trades':        self.n_trades,
+            'win_rate':      f"{self.win_rate:.1%}",
+            'profit_factor': f"{self.profit_factor:.2f}",
+            'net_pnl':       f"${self.net_pnl:.2f}",
         }
 
     @abstractmethod
@@ -192,163 +153,146 @@ class BaseStrategy(ABC):
 
 
 # ─────────────────────────────────────────────
-# STRATEGY 1 — TREND (EMA Crossover + MACD)
+# IFVG + DISCOUNT/PREMIUM STRATEGY
 # ─────────────────────────────────────────────
-class TrendStrategy(BaseStrategy):
-    def __init__(self):
-        super().__init__("TrendEMA")
-
-    def generate_signal(self, df: pd.DataFrame) -> int:
-        r = df.iloc[-1]
-        if r['close'] > r['EMA_20']:
-            return 1
-        return -1
-
-
-# ─────────────────────────────────────────────
-# STRATEGY 2 — MEAN REVERSION (RSI)
-# ─────────────────────────────────────────────
-class ReversionStrategy(BaseStrategy):
-    def __init__(self):
-        super().__init__("RSIReversion")
-
-    def generate_signal(self, df: pd.DataFrame) -> int:
-        rsi = df.iloc[-1].get('RSI', 50) or 50
-        if rsi <= 50:
-            return 1   # Below midpoint → BUY
-        return -1      # Above midpoint → SELL
-
-
-# ─────────────────────────────────────────────
-# STRATEGY 3 — BREAKOUT (Bollinger Bands + ATR)
-# ─────────────────────────────────────────────
-class BreakoutStrategy(BaseStrategy):
-    def __init__(self):
-        super().__init__("BBBreakout")
-
-    def generate_signal(self, df: pd.DataFrame) -> int:
-        if len(df) < 3:
-            return 0
-        r    = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        bb_upper = r.get('BB_upper', None)
-        bb_lower = r.get('BB_lower', None)
-        if bb_upper is None or bb_lower is None:
-            return 0
-
-        bb_width = float(bb_upper) - float(bb_lower)
-        atr      = float(r.get('ATR', 0) or 0)
-        if bb_width <= 0 or atr <= 0:
-            return 0
-
-        close_now  = float(r['close'])
-        bb_upper_f = float(bb_upper)
-        bb_lower_f = float(bb_lower)
-        bb_mid     = float(r.get('BB_mid', (bb_upper_f + bb_lower_f) / 2))
-
-        if close_now > bb_mid:
-            return 1   # Above midline → bullish
-        if close_now < bb_mid:
-            return -1  # Below midline → bearish
-        return 0
-
-
-# ─────────────────────────────────────────────
-# STRATEGY 4 — KRONOS AI (optional)
-# ─────────────────────────────────────────────
-class KronosStrategy(BaseStrategy):
-    PRED_LEN      = 8     # candles to predict ahead (8 × 15 min = 2 h)
-    MIN_CHANGE    = 0.002 # ≥0.2% predicted move to signal
+class IFVGStrategy(BaseStrategy):
+    """
+    Smart Money Concepts entry logic:
+    1. Identify swing range → midpoint → Discount (lower half) / Premium (upper half)
+    2. Scan for FVGs (Fair Value Gaps) in recent candles
+    3. Detect IFVGs: FVGs that price fully traded through (inverted role)
+       - Filled bearish FVG → bullish IFVG (support) → BUY in discount
+       - Filled bullish FVG → bearish IFVG (resistance) → SELL in premium
+    4. SL at IFVG zone boundary (wick), TP at 6R
+    """
+    LOOKBACK  = 80   # bars to search for FVGs
+    ZONE_BARS = 120  # bars for swing high/low range
+    ATR_TOL   = 2.0  # proximity tolerance in ATR units
 
     def __init__(self):
-        super().__init__("KronosAI")
-        self.predictor = None
-        if KRONOS_AVAILABLE:
-            self._load()
-        else:
-            self.enabled = False
+        super().__init__("IFVG_SMC")
 
-    def _load(self):
-        try:
-            print("⏳ KronosAI: Loading Kronos-mini from HuggingFace…")
-            tokenizer      = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k")
-            model          = Kronos.from_pretrained("NeoQuasar/Kronos-mini")
-            self.predictor = KronosPredictor(model, tokenizer, max_context=256)
-            print("✅ KronosAI: Ready")
-        except Exception as e:
-            print(f"⚠️  KronosAI load failed: {e} — disabled")
-            self.enabled = False
+    # ── internal helpers ──
+
+    def _find_fvgs(self, df: pd.DataFrame) -> list[dict]:
+        bars = df.reset_index(drop=True)
+        n    = len(bars)
+        fvgs = []
+        for i in range(1, n - 1):
+            ph = float(bars.iloc[i - 1]['high'])
+            pl = float(bars.iloc[i - 1]['low'])
+            nh = float(bars.iloc[i + 1]['high'])
+            nl = float(bars.iloc[i + 1]['low'])
+            # Bullish FVG: gap up between prev high and next low
+            if ph < nl:
+                fvgs.append({'type': 'bull', 'low': ph, 'high': nl, 'idx': i})
+            # Bearish FVG: gap down between prev low and next high
+            if pl > nh:
+                fvgs.append({'type': 'bear', 'low': nh, 'high': pl, 'idx': i})
+        return fvgs
+
+    def _get_ifvgs(self, df: pd.DataFrame) -> list[dict]:
+        """
+        IFVGs = FVGs that have been fully filled by subsequent price action.
+        Filled bullish FVG  → bearish IFVG (price traded down through it)
+        Filled bearish FVG  → bullish IFVG (price traded up through it)
+        """
+        bars = df.reset_index(drop=True)
+        fvgs = self._find_fvgs(bars)
+        ifvgs = []
+        for fvg in fvgs:
+            after_idx = fvg['idx'] + 2
+            if after_idx >= len(bars):
+                continue
+            after = bars.iloc[after_idx:]
+            if fvg['type'] == 'bull':
+                if float(after['low'].min()) <= fvg['low']:
+                    ifvgs.append({'type': 'bear', 'low': fvg['low'], 'high': fvg['high']})
+            else:
+                if float(after['high'].max()) >= fvg['high']:
+                    ifvgs.append({'type': 'bull', 'low': fvg['low'], 'high': fvg['high']})
+        return ifvgs
+
+    # ── public API ──
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        """
+        Returns (signal, wick_price).
+        wick_price is the IFVG boundary used as SL reference:
+          BUY  → IFVG low  (SL goes just below this)
+          SELL → IFVG high (SL goes just above this)
+        Returns (0, 0.0) when no setup found.
+        """
+        if len(df) < self.ZONE_BARS + 5:
+            return 0, 0.0
+
+        r   = df.iloc[-1]
+        atr = float(r.get('ATR', 0) or 0)
+        if atr == 0:
+            return 0, 0.0
+
+        current = float(r['close'])
+
+        # Discount / Premium
+        zone_df    = df.tail(self.ZONE_BARS)
+        swing_high = float(zone_df['high'].max())
+        swing_low  = float(zone_df['low'].min())
+        midpoint   = (swing_high + swing_low) / 2.0
+        in_discount = current < midpoint
+        in_premium  = current > midpoint
+
+        # IFVGs from recent lookback
+        ifvgs = self._get_ifvgs(df.tail(self.LOOKBACK + 3))
+        tol   = atr * self.ATR_TOL
+
+        if in_discount:
+            for z in sorted(ifvgs, key=lambda x: abs(current - (x['low'] + x['high']) / 2)):
+                if z['type'] == 'bull' and z['low'] - tol <= current <= z['high'] + tol:
+                    print(
+                        f"  🔵 IFVG Bullish zone [{z['low']:.2f} – {z['high']:.2f}] "
+                        f"| Discount | price={current:.2f}"
+                    )
+                    return 1, z['low']
+
+        if in_premium:
+            for z in sorted(ifvgs, key=lambda x: abs(current - (x['low'] + x['high']) / 2)):
+                if z['type'] == 'bear' and z['low'] - tol <= current <= z['high'] + tol:
+                    print(
+                        f"  🔴 IFVG Bearish zone [{z['low']:.2f} – {z['high']:.2f}] "
+                        f"| Premium | price={current:.2f}"
+                    )
+                    return -1, z['high']
+
+        # Log zone status for debugging
+        zone = "DISCOUNT" if in_discount else "PREMIUM"
+        print(f"  ⏸  No IFVG match | {zone} | price={current:.2f} mid={midpoint:.2f} | IFVGs found: {len(ifvgs)}")
+        return 0, 0.0
 
     def generate_signal(self, df: pd.DataFrame) -> int:
-        if not self.enabled or self.predictor is None:
-            return 0
-        try:
-            context = df.tail(200)[['open', 'high', 'low', 'close', 'volume']].reset_index(drop=True)
-            n = len(context)
-            x_ts = pd.to_datetime(pd.Series(range(n)), unit='s')
-            y_ts = pd.to_datetime(pd.Series(range(n, n + self.PRED_LEN)), unit='s')
-
-            pred = self.predictor.predict(
-                df=context,
-                x_timestamp=x_ts,
-                y_timestamp=y_ts,
-                pred_len=self.PRED_LEN,
-                T=1.0, top_p=0.9, sample_count=1, verbose=False,
-            )
-            current  = float(context.iloc[-1]['close'])
-            forecast = float(pred.iloc[-1]['close'])
-            chg      = (forecast - current) / current
-
-            if chg > self.MIN_CHANGE:
-                return 1
-            if chg < -self.MIN_CHANGE:
-                return -1
-        except Exception as e:
-            print(f"⚠️  KronosAI signal error: {e}")
-        return 0
+        signal, _ = self.get_signal_and_wick(df)
+        return signal
 
 
 # ─────────────────────────────────────────────
 # META CONTROLLER
 # ─────────────────────────────────────────────
 class MetaController:
-    """
-    Combines signals from all active strategies via weighted voting.
-    Periodically prints a strategy status table.
-    """
-    SIGNAL_THRESHOLD = 0.0    # any signal fires
-
     def __init__(self, strategies: list[BaseStrategy]):
-        self.strategies  = strategies
+        self.strategies   = strategies
         self._last_report = 0.0
 
     def get_signal(self, df: pd.DataFrame) -> tuple[int, str]:
-        """Returns (signal, comma-separated strategy names that agreed)."""
-        votes = []
         for s in self.strategies:
             if not s.enabled:
                 continue
             sig = s.generate_signal(df)
             if sig != 0:
-                votes.append((s.name, sig, s.weight))
-
-        if not votes:
-            return 0, ''
-
-        weighted_sum   = sum(sig * w for _, sig, w in votes)
-        total_weight   = sum(w for _, _, w in votes)
-        normalized     = weighted_sum / total_weight if total_weight else 0
-
-        if normalized >= 0:
-            agree = '+'.join(n for n, sig, _ in votes if sig == 1)
-            return 1, agree
-        agree = '+'.join(n for n, sig, _ in votes if sig == -1)
-        return -1, agree
+                return sig, s.name
+        return 0, ''
 
     def report(self):
         now = time.time()
-        if now - self._last_report < 1800:  # every 30 min
+        if now - self._last_report < 1800:
             return
         self._last_report = now
         print("\n╔══════════════════ STRATEGY STATUS ══════════════════╗")
@@ -356,7 +300,7 @@ class MetaController:
             st    = s.status()
             state = "✅ ACTIVE  " if st['enabled'] else "⛔ DISABLED"
             print(
-                f"║ {state}  {st['strategy']:<14}"
+                f"║ {state}  {st['strategy']:<16}"
                 f"  T={st['trades']:<4}  WR={st['win_rate']:<8}"
                 f"  PF={st['profit_factor']:<6}  PnL={st['net_pnl']}"
             )
@@ -389,7 +333,7 @@ class AnalyticsEngine:
 
     def log_open(self, pos_id: str, side: str, entry: float,
                  sl: float, tp: float, lot: float, strategy: str):
-        rec = {
+        self.records.append({
             'position_id': pos_id,
             'entry_time':  datetime.now(timezone.utc).isoformat(),
             'exit_time':   None,
@@ -402,8 +346,7 @@ class AnalyticsEngine:
             'strategy':    strategy,
             'pnl':         None,
             'status':      'OPEN',
-        }
-        self.records.append(rec)
+        })
         self._save()
 
     def log_close(self, pos_id: str, exit_price: float, pnl: float):
@@ -426,39 +369,12 @@ class AnalyticsEngine:
         g_win     = sum(r['pnl'] for r in closed if (r['pnl'] or 0) > 0)
         g_loss    = abs(sum(r['pnl'] for r in closed if (r['pnl'] or 0) < 0))
         pf        = round(g_win / g_loss, 3) if g_loss > 0 else None
-
-        # Max drawdown (equity curve)
-        equity = 0.0
-        peak   = 0.0
-        mdd    = 0.0
-        for r in sorted(closed, key=lambda x: x['entry_time']):
-            equity += r['pnl'] or 0
-            peak    = max(peak, equity)
-            dd      = peak - equity
-            mdd     = max(mdd, dd)
-
-        # Per-strategy breakdown
-        by_strategy: dict[str, dict] = {}
-        for r in closed:
-            s = r.get('strategy', 'unknown')
-            if s not in by_strategy:
-                by_strategy[s] = {'trades': 0, 'wins': 0, 'pnl': 0.0}
-            by_strategy[s]['trades'] += 1
-            by_strategy[s]['pnl']    += r['pnl'] or 0
-            if (r['pnl'] or 0) > 0:
-                by_strategy[s]['wins'] += 1
-        for s, v in by_strategy.items():
-            v['win_rate'] = f"{v['wins']/v['trades']:.1%}" if v['trades'] else '0%'
-            v['pnl']      = round(v['pnl'], 2)
-
         return {
-            'total_closed':    len(closed),
-            'open_positions':  len(open_),
-            'win_rate':        f"{wins/len(closed):.1%}",
-            'profit_factor':   pf,
-            'net_pnl':         round(total_pnl, 2),
-            'max_drawdown':    round(mdd, 2),
-            'by_strategy':     by_strategy,
+            'total_closed':   len(closed),
+            'open_positions': len(open_),
+            'win_rate':       f"{wins/len(closed):.1%}",
+            'profit_factor':  pf,
+            'net_pnl':        round(total_pnl, 2),
         }
 
 
@@ -466,39 +382,32 @@ class AnalyticsEngine:
 # EXECUTION ENGINE
 # ─────────────────────────────────────────────
 class ExecutionEngine:
+    COOLDOWN_SECS = 360   # 6 minutes after SL/TP before next entry
+
     def __init__(self, token: str, account_id: str, symbol: str = "USOIL"):
         self.token      = token
         self.account_id = account_id
         self.symbol     = symbol
         self.is_running = True
 
-        # Layers
-        strategies = [
-            TrendStrategy(),
-            ReversionStrategy(),
-            BreakoutStrategy(),
-            KronosStrategy(),
-        ]
-        self.meta      = MetaController(strategies)
-        self.analytics = AnalyticsEngine()
+        self.ifvg_strategy = IFVGStrategy()
+        self.meta          = MetaController([self.ifvg_strategy])
+        self.analytics     = AnalyticsEngine()
 
-        # State
-        self.connection   = None
-        self.account      = None
-        self.symbol_spec  = None
-        self.api          = None
+        self.connection  = None
+        self.account     = None
+        self.symbol_spec = None
+        self.api         = None
 
-        # Position tracking for PnL attribution: {positionId: strategy_name}
         self.tracked: dict[str, str] = {}
-        # Cooldown: block new entries for 6 min after a position closes
-        self.last_close_time: float = 0.0
-        self.COOLDOWN_SECS: int = 0  # re-enter immediately after close
+        self.last_close_time: float  = 0.0
 
     def stop(self, *_):
         self.is_running = False
         print("🛑 Shutdown signal received")
 
     # ── broker helpers ──
+
     async def _refresh_spec(self):
         try:
             self.symbol_spec = await self.connection.get_symbol_specification(self.symbol)
@@ -535,36 +444,40 @@ class ExecutionEngine:
         return max(float(stop_level) * self._point(), 0.10)
 
     def _snap(self, value: float, direction: str = 'nearest') -> float:
-        pt = Decimal(str(self._point()))
+        pt     = Decimal(str(self._point()))
         scaled = Decimal(str(value)) / pt
-        rmap = {'down': ROUND_FLOOR, 'up': ROUND_CEILING, 'nearest': ROUND_HALF_UP}
+        rmap   = {'down': ROUND_FLOOR, 'up': ROUND_CEILING, 'nearest': ROUND_HALF_UP}
         return float(scaled.to_integral_value(rounding=rmap[direction]) * pt)
 
     def _build_levels(self, side: str, entry: float, wick: float):
+        """
+        wick = IFVG zone boundary used as SL anchor.
+        BUY:  SL just below wick (IFVG low), TP = entry + 6 * risk
+        SELL: SL just above wick (IFVG high), TP = entry - 6 * risk
+        """
         min_d = self._min_stop()
         buf   = self._point()
         if side == 'BUY':
             desired_sl = wick - buf
-            sl   = min(desired_sl, entry - min_d)
-            sl   = self._snap(sl, 'down')
-            risk = max(entry - sl, min_d)
-            tp   = self._snap(entry + risk * 6, 'up')
-            return sl, tp, self._snap(desired_sl, 'down')
-        desired_sl = wick + buf
-        sl   = max(desired_sl, entry + min_d)
-        sl   = self._snap(sl, 'up')
-        risk = max(sl - entry, min_d)
-        tp   = self._snap(entry - risk * 6, 'down')
-        return sl, tp, self._snap(desired_sl, 'up')
+            sl         = min(desired_sl, entry - min_d)
+            sl         = self._snap(sl, 'down')
+            risk       = max(entry - sl, min_d)
+            tp         = self._snap(entry + risk * 6, 'up')
+        else:
+            desired_sl = wick + buf
+            sl         = max(desired_sl, entry + min_d)
+            sl         = self._snap(sl, 'up')
+            risk       = max(sl - entry, min_d)
+            tp         = self._snap(entry - risk * 6, 'down')
+        return sl, tp
 
-    # ── position-close detection ──
+    # ── closed-position detection ──
+
     async def _process_closed_positions(self, live_ids: set[str]):
-        """Detect positions that vanished and attribute PnL to their strategy."""
         closed_ids = set(self.tracked.keys()) - live_ids
         if not closed_ids:
             return
 
-        # Fetch today's deals once (if any positions closed)
         deals_by_pos: dict[str, list] = {}
         try:
             now      = datetime.now(timezone.utc)
@@ -580,38 +493,45 @@ class ExecutionEngine:
         for pos_id in closed_ids:
             strategy_name = self.tracked.pop(pos_id)
             pnl, exit_price = 0.0, 0.0
-
             pos_deals = deals_by_pos.get(pos_id, [])
             closing   = next(
-                (d for d in pos_deals if d.get('entryType') == 'DEAL_ENTRY_OUT'),
-                None
+                (d for d in pos_deals if d.get('entryType') == 'DEAL_ENTRY_OUT'), None
             )
             if closing:
                 pnl        = float(closing.get('profit', 0))
                 exit_price = float(closing.get('price', 0))
 
-            # Attribute PnL to strategy
             strategy = next((s for s in self.meta.strategies if s.name == strategy_name), None)
             if strategy:
                 strategy.record_trade(pnl)
 
             self.analytics.log_close(pos_id, exit_price, pnl)
             self.last_close_time = time.time()
-            result = "WIN" if pnl > 0 else "LOSS"
+            result = "WIN ✅" if pnl > 0 else "LOSS ❌"
             print(
-                f"📊 Position closed | {result} | strategy={strategy_name} | PnL=${pnl:.2f} | "
-                f"Next entry allowed in {self.COOLDOWN_SECS // 60} min"
+                f"📊 Position closed | {result} | PnL=${pnl:.2f} | "
+                f"Cooldown: next entry in {self.COOLDOWN_SECS // 60} min"
             )
 
         self.meta.report()
 
-    # ── main run loop ──
+    # ── candle fetch (account-level REST, works with RPC connection) ──
+
+    async def _fetch_candles(self) -> pd.DataFrame:
+        start_time = datetime.now(timezone.utc) - timedelta(days=10)
+        candles = await self.account.get_historical_candles(
+            self.symbol, '15m', start_time, 500
+        )
+        if not candles:
+            raise RuntimeError('No candles returned')
+        df = pd.DataFrame(candles)
+        return FeatureEngine.add_indicators(df)
+
+    # ── main loop ──
+
     async def run(self):
-        print(f"🔱 SHIVA V5 LIVE | {self.symbol} | Multi-Strategy Meta Controller")
-        self.api = MetaApi(self.token, {
-            'provisioningUrl': 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai',
-            'mtUrl':           'https://mt-client-api-v1.london.agiliumtrade.agiliumtrade.ai',
-        })
+        print(f"🔱 SHIVA V5 LIVE | {self.symbol} | IFVG + Discount/Premium")
+        self.api = MetaApi(self.token)
         try:
             self.account = await self.api.metatrader_account_api.get_account(self.account_id)
             await self.account.wait_connected()
@@ -624,95 +544,85 @@ class ExecutionEngine:
                 f"Server: {getattr(self.account, 'server', '?')} | "
                 f"Login: {getattr(self.account, 'login', '?')}"
             )
-
-            # Print active strategy list
-            print("\n── Active Strategies ─────────────────────────")
-            for s in self.meta.strategies:
-                tag = "ACTIVE" if s.enabled else "DISABLED"
-                print(f"  [{tag}] {s.name}")
-            print("──────────────────────────────────────────────\n")
+            print("\n── Strategy ─────────────────────────────────────────")
+            print("  [ACTIVE] IFVG_SMC  (Inverse FVG + Discount/Premium)")
+            print("  SL: IFVG zone boundary (wick)  |  TP: 6R")
+            print(f"  Cooldown after SL/TP: {self.COOLDOWN_SECS // 60} min")
+            print("─────────────────────────────────────────────────────\n")
 
             while self.is_running:
                 try:
-                    # ── 1. Fetch candles and indicators ──
-                    candles = await self.connection.get_historical_candles(self.symbol, '15m', limit=500)
-                    df = FeatureEngine.add_indicators(pd.DataFrame(candles))
+                    # 1. Candles + indicators
+                    df = await self._fetch_candles()
                     if df.empty:
-                        raise RuntimeError('Indicator frame empty after preprocessing')
+                        raise RuntimeError('Empty indicator frame')
 
-                    # ── 2. Get live positions ──
-                    positions  = await self.connection.get_positions()
-                    live_ids   = {p['id'] for p in positions}
-                    current    = next((p for p in positions if p['symbol'] == self.symbol), None)
+                    # 2. Live positions
+                    positions = await self.connection.get_positions()
+                    live_ids  = {p['id'] for p in positions}
+                    current   = next((p for p in positions if p['symbol'] == self.symbol), None)
 
-                    # ── 3. Detect and process closed positions ──
+                    # 3. Detect closed positions
                     await self._process_closed_positions(live_ids)
 
-                    # ── 4. Meta Controller signal ──
-                    signal, triggering_strategies = self.meta.get_signal(df)
-
-                    # ── 5. Execute if no open position, cooldown passed, and signal exists ──
+                    # 4. Cooldown check
                     secs_since_close = time.time() - self.last_close_time
                     in_cooldown = self.last_close_time > 0 and secs_since_close < self.COOLDOWN_SECS
                     if in_cooldown and not current:
                         remaining = int(self.COOLDOWN_SECS - secs_since_close)
-                        print(f"⏳ Cooldown active — next entry in {remaining}s")
+                        print(f"⏳ Cooldown — next entry in {remaining}s")
+                        await asyncio.sleep(30)
+                        continue
 
-                    if not current and signal != 0 and not in_cooldown:
-                        lot   = 0.01
+                    # 5. Signal from IFVG strategy
+                    if not current:
+                        signal, wick = self.ifvg_strategy.get_signal_and_wick(df)
+                    else:
+                        signal, wick = 0, 0.0
+
+                    # 6. Execute
+                    if not current and signal != 0 and wick != 0.0:
+                        lot   = float(os.getenv('LOT_SIZE', '0.01'))
                         price = await self._get_price()
-                        r     = df.iloc[-1]
 
                         if signal == 1:
-                            entry = float(price.get('ask') or price.get('bid') or r['close'])
-                            sl, tp, target_sl = self._build_levels('BUY', entry, float(r['low']))
-                            print(
-                                f"🚀 BUY  {self.symbol} @ {entry:.2f} | "
-                                f"SL {sl:.2f} | TP {tp:.2f} | [{triggering_strategies}]"
-                            )
+                            entry = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
+                            sl, tp = self._build_levels('BUY', entry, wick)
+                            print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | wick={wick:.2f}")
                             result = await self.connection.create_market_buy_order(
                                 self.symbol, lot, sl, tp,
-                                {'comment': f'SHIVA:{triggering_strategies[:20]}'},
+                                {'comment': 'SHIVA:IFVG_BUY'},
                             )
                         else:
-                            entry = float(price.get('bid') or price.get('ask') or r['close'])
-                            sl, tp, target_sl = self._build_levels('SELL', entry, float(r['high']))
-                            print(
-                                f"📉 SELL {self.symbol} @ {entry:.2f} | "
-                                f"SL {sl:.2f} | TP {tp:.2f} | [{triggering_strategies}]"
-                            )
+                            entry = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
+                            sl, tp = self._build_levels('SELL', entry, wick)
+                            print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | wick={wick:.2f}")
                             result = await self.connection.create_market_sell_order(
                                 self.symbol, lot, sl, tp,
-                                {'comment': f'SHIVA:{triggering_strategies[:20]}'},
+                                {'comment': 'SHIVA:IFVG_SELL'},
                             )
 
-                        # Track the new position for attribution
+                        # Track new position
                         new_positions = await self.connection.get_positions()
                         new_pos = next(
                             (p for p in new_positions
                              if p['symbol'] == self.symbol and p['id'] not in live_ids),
-                            None
+                            None,
                         )
                         if new_pos:
-                            pos_id = new_pos['id']
-                            side   = 'BUY' if signal == 1 else 'SELL'
-                            self.tracked[pos_id] = triggering_strategies
+                            side = 'BUY' if signal == 1 else 'SELL'
+                            self.tracked[new_pos['id']] = self.ifvg_strategy.name
                             self.analytics.log_open(
-                                pos_id, side, entry, sl, tp, lot, triggering_strategies
+                                new_pos['id'], side, entry, sl, tp, lot, self.ifvg_strategy.name
                             )
-
-                    # ── 6. Periodic summary ──
-                    summary = self.analytics.summary()
-                    if summary.get('total_closed', 0) > 0 and summary['total_closed'] % 5 == 0:
-                        print(f"📈 Analytics: {summary}")
 
                     await asyncio.sleep(60)
 
                 except Exception as e:
                     msg = str(e)
                     print(f"⚠️  Loop warning: {msg[:200]}")
-                    if 'cpu credits' in msg or 'rate' in msg.lower() or '429' in msg:
-                        print("🚦 Rate limited — waiting 10 minutes before retry")
+                    if 'cpu credits' in msg or '429' in msg or 'rate' in msg.lower():
+                        print("🚦 Rate limited — backing off 10 min")
                         await asyncio.sleep(600)
                     elif 'Market is closed' in msg:
                         await asyncio.sleep(300)
@@ -729,8 +639,8 @@ class ExecutionEngine:
             try:
                 if self.connection:
                     await self.connection.close()
-            except Exception as e:
-                print(f"⚠️  Connection close: {e}")
+            except Exception:
+                pass
             print("🔁 Engine exited")
 
 
@@ -747,9 +657,8 @@ if __name__ == "__main__":
     ACCOUNT_ID = require_env('METAAPI_ACCOUNT_ID')
     SYMBOL     = os.getenv('SYMBOL', 'USOIL')
 
-    print(f"🚀 Starting SHIVA V5  |  {SYMBOL}  |  MULTI-STRATEGY")
+    print(f"🚀 Starting SHIVA V5  |  {SYMBOL}  |  IFVG + DISCOUNT/PREMIUM")
 
-    # Bootstrap analytics so health server can serve /status
     _bootstrap_analytics = AnalyticsEngine()
     start_health_server(_bootstrap_analytics)
 
@@ -757,7 +666,7 @@ if __name__ == "__main__":
         engine = None
         try:
             engine = ExecutionEngine(TOKEN, ACCOUNT_ID, SYMBOL)
-            engine.analytics = _bootstrap_analytics  # share the same analytics instance
+            engine.analytics = _bootstrap_analytics
             signal.signal(signal.SIGTERM, engine.stop)
             signal.signal(signal.SIGINT,  engine.stop)
             asyncio.run(engine.run())
