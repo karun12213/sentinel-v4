@@ -914,8 +914,7 @@ class ExecutionEngine:
             print(
                 f"✅ MetaApi synchronized | {self.symbol}\n"
                 f"── Strategy ──────────────────────────────────────────\n"
-                f"  [1] FVG_SCALP  — fresh FVG first-touch scalp\n"
-                f"  [2] EMA_BOUNCE — EMA20 dynamic S/R bounce\n"
+                f"  [1] FVG_SCALP  — fresh FVG first-touch scalp (V10: EMA_BOUNCE removed)\n"
                 f"  Fixed SL: {sl_pts} pts | TP: {sl_pts * tp_mult:.2f} pts ({tp_mult:.0f}R)\n"
                 f"  Dynamic lot: $100=$0.01  $300=$0.03  $600=$0.06  $900=$0.09\n"
                 f"  Daily limit: {self.max_daily_trades} trades | Cooldown: {self.COOLDOWN_SECS // 60} min\n"
