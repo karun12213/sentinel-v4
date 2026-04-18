@@ -215,42 +215,57 @@ class BaseStrategy(ABC):
 
 
 # ─────────────────────────────────────────────
-# IFVG + DISCOUNT/PREMIUM STRATEGY  (optimised)
+# IFVG + DISCOUNT/PREMIUM STRATEGY  (v3 — fully optimised)
 # ─────────────────────────────────────────────
 class IFVGStrategy(BaseStrategy):
     """
-    Smart Money Concepts — optimised entry rules:
+    10-point entry checklist — ALL must pass:
 
-    ENTRY checklist (ALL must pass):
-    ① Price candle physically overlaps the IFVG zone (not just near it)
-    ② Candle shows reversal confirmation at the zone:
-         BUY  → close ≥ zone midpoint  (price rejected downward wick, closed above)
-         SELL → close ≤ zone midpoint  (price rejected upward wick, closed below)
-    ③ EMA-200 trend alignment:
-         BUY  → close > EMA-200  (buying a pullback in uptrend)
-         SELL → close < EMA-200  (selling a bounce in downtrend)
-    ④ RSI confirmation:
-         BUY  → RSI < 60  (not overbought)
-         SELL → RSI > 40  (not oversold)
+    ZONE QUALITY
+    ① Zone width ≥ MIN_WIDTH_PCT of price  (no noise zones)
+    ② IFVG age ≤ MAX_AGE bars             (fresh zones only)
+    ③ Zone not invalidated after formation:
+         Bullish IFVG → price never closed below zone.low after IFVG formed
+         Bearish IFVG → price never closed above zone.high after IFVG formed
+
+    CONTEXT
+    ④ EMA-200 trend alignment:
+         BUY  → close > EMA-200  (pullback in uptrend)
+         SELL → close < EMA-200  (bounce in downtrend)
     ⑤ Discount/Premium zone:
-         BUY  → price < range midpoint  (discount)
-         SELL → price > range midpoint  (premium)
-    ⑥ IFVG age ≤ MAX_AGE bars (fresh zones only)
-    ⑦ Zone width ≥ MIN_WIDTH_PCT of price (filter micro-noise zones)
+         BUY  → close < range midpoint  (discount)
+         SELL → close > range midpoint  (premium)
+    ⑥ RSI in valid range:
+         BUY  → RSI 20–55  (neutral/oversold only)
+         SELL → RSI 45–80  (neutral/overbought only)
 
-    SL: IFVG zone boundary (wick level)
-    TP: 6R
+    CANDLE TRIGGER (zone touch + reversal)
+    ⑦ Candle enters IFVG zone from the correct side:
+         BUY  → bar low  ≤ zone.high  (candle dipped into bullish zone)
+         SELL → bar high ≥ zone.low   (candle rallied into bearish zone)
+    ⑧ Candle body confirms zone HELD:
+         BUY  → close ≥ zone.low   (closed above zone floor — zone supported)
+         SELL → close ≤ zone.high  (closed below zone ceiling — zone resisted)
+    ⑨ Candle body direction:
+         BUY  → close ≥ open  (bullish rejection bar)
+         SELL → close ≤ open  (bearish rejection bar)
+
+    RISK
+    ⑩ Risk ≤ 1.5 × ATR  (rejects entries with overly wide SL)
     """
-    LOOKBACK     = 50    # bars to scan for FVGs
-    ZONE_BARS    = 100   # bars for swing range
-    MAX_AGE      = 25    # max bars since IFVG formed
-    MIN_WIDTH_PCT = 0.0015  # zone must be ≥ 0.15% of price
+    LOOKBACK      = 50    # bars to scan for FVGs
+    ZONE_BARS     = 100   # bars for swing range
+    MAX_AGE       = 20    # max bars since IFVG formed (fresh only)
+    MIN_WIDTH_PCT = 0.002 # zone ≥ 0.2% of price (filters micro-noise)
+    MAX_RISK_ATR  = 1.5   # SL risk capped at 1.5 × ATR
 
     def __init__(self):
         super().__init__("IFVG_SMC")
 
-    def _find_fvgs(self, df: pd.DataFrame) -> list[dict]:
-        bars = df.reset_index(drop=True)
+    # ── FVG detection ──
+
+    def _find_fvgs(self, bars: pd.DataFrame) -> list[dict]:
+        bars = bars.reset_index(drop=True)
         n    = len(bars)
         fvgs = []
         for i in range(1, n - 1):
@@ -258,65 +273,88 @@ class IFVGStrategy(BaseStrategy):
             pl = float(bars.iloc[i - 1]['low'])
             nh = float(bars.iloc[i + 1]['high'])
             nl = float(bars.iloc[i + 1]['low'])
-            if ph < nl:   # bullish FVG
+            if ph < nl:
                 fvgs.append({'type': 'bull', 'low': ph, 'high': nl, 'idx': i})
-            if pl > nh:   # bearish FVG
+            if pl > nh:
                 fvgs.append({'type': 'bear', 'low': nh, 'high': pl, 'idx': i})
         return fvgs
 
     def _get_ifvgs(self, df: pd.DataFrame) -> list[dict]:
         """
-        Returns IFVGs with 'age' (bars since formed) and 'width'.
-        Filled bullish FVG  → bearish IFVG
-        Filled bearish FVG  → bullish IFVG
+        Detects IFVGs with full invalidation check:
+          Bullish FVG filled → bearish IFVG (resistance)
+            → invalidated if a subsequent close > zone.high
+          Bearish FVG filled → bullish IFVG (support)
+            → invalidated if a subsequent close < zone.low
         """
         bars  = df.reset_index(drop=True)
         n     = len(bars)
         fvgs  = self._find_fvgs(bars)
         ifvgs = []
+
         for fvg in fvgs:
-            after_idx = fvg['idx'] + 2
-            if after_idx >= n:
+            start = fvg['idx'] + 2
+            if start >= n:
                 continue
-            after = bars.iloc[after_idx:]
-            age   = n - 1 - fvg['idx']   # bars since this FVG formed
+            after = bars.iloc[start:]
+            age   = n - 1 - fvg['idx']
 
             if fvg['type'] == 'bull':
-                if float(after['low'].min()) <= fvg['low']:
-                    ifvgs.append({
-                        'type': 'bear', 'low': fvg['low'], 'high': fvg['high'],
-                        'age': age, 'width': fvg['high'] - fvg['low'],
-                    })
-            else:
-                if float(after['high'].max()) >= fvg['high']:
-                    ifvgs.append({
-                        'type': 'bull', 'low': fvg['low'], 'high': fvg['high'],
-                        'age': age, 'width': fvg['high'] - fvg['low'],
-                    })
+                # Bullish FVG filled when price trades below fvg.low
+                fill_mask = after['low'] <= fvg['low']
+                if not fill_mask.any():
+                    continue
+                fill_pos  = fill_mask.idxmax()            # first bar that fills it
+                post_fill = bars.loc[fill_pos + 1:]       # bars after fill
+                # Invalidated if price closes above zone.high after becoming bearish IFVG
+                if not post_fill.empty and float(post_fill['close'].max()) > fvg['high']:
+                    continue
+                ifvgs.append({
+                    'type': 'bear', 'low': fvg['low'], 'high': fvg['high'],
+                    'age': age, 'width': fvg['high'] - fvg['low'],
+                })
+
+            else:  # bearish FVG
+                # Bearish FVG filled when price trades above fvg.high
+                fill_mask = after['high'] >= fvg['high']
+                if not fill_mask.any():
+                    continue
+                fill_pos  = fill_mask.idxmax()
+                post_fill = bars.loc[fill_pos + 1:]
+                # Invalidated if price closes below zone.low after becoming bullish IFVG
+                if not post_fill.empty and float(post_fill['close'].min()) < fvg['low']:
+                    continue
+                ifvgs.append({
+                    'type': 'bull', 'low': fvg['low'], 'high': fvg['high'],
+                    'age': age, 'width': fvg['high'] - fvg['low'],
+                })
+
         return ifvgs
+
+    # ── signal ──
 
     def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
         """
-        Returns (signal, wick_price).
-          BUY  → wick = IFVG low  (SL anchor)
-          SELL → wick = IFVG high (SL anchor)
-        Returns (0, 0.0) when no valid setup.
+        Returns (signal, wick_price) or (0, 0.0) when no valid setup.
+        wick_price = SL anchor (zone.low for BUY, zone.high for SELL).
         """
         if len(df) < self.ZONE_BARS + 5:
             return 0, 0.0
 
-        r   = df.iloc[-1]
-        atr = float(r.get('ATR', 0) or 0)
+        r    = df.iloc[-1]
+        prev = df.iloc[-2]
+        atr  = float(r.get('ATR', 0) or 0)
         if atr == 0:
             return 0, 0.0
 
         close  = float(r['close'])
+        open_  = float(r['open'])
         high   = float(r['high'])
         low    = float(r['low'])
         ema200 = float(r.get('EMA_200', close) or close)
         rsi    = float(r.get('RSI', 50) or 50)
 
-        # ③ EMA-200 trend
+        # ④ EMA-200 trend alignment
         uptrend   = close > ema200
         downtrend = close < ema200
 
@@ -328,46 +366,49 @@ class IFVGStrategy(BaseStrategy):
         in_discount = close < midpoint
         in_premium  = close > midpoint
 
-        # Fetch IFVGs
         ifvgs = self._get_ifvgs(df.tail(self.LOOKBACK + 3))
-
         min_w = close * self.MIN_WIDTH_PCT
 
-        # ── BUY setup ──
-        if in_discount and uptrend and rsi < 60:
-            candidates = [
-                z for z in ifvgs
-                if z['type'] == 'bull'
-                and z['age'] <= self.MAX_AGE           # ⑥ fresh
-                and z['width'] >= min_w                # ⑦ real zone
-                and low  <= z['high']                  # ① candle overlaps zone
-                and high >= z['low']
-                and close >= (z['low'] + z['high']) / 2  # ② closed above zone midpoint
-            ]
+        # ── BUY: checks ④⑤⑥ ──
+        if in_discount and uptrend and 20 <= rsi <= 55:
+            candidates = []
+            for z in ifvgs:
+                if z['type'] != 'bull':                            continue
+                if z['age'] > self.MAX_AGE:                        continue  # ②
+                if z['width'] < min_w:                             continue  # ①
+                if low  > z['high']:                               continue  # ⑦ candle must enter zone
+                if high < z['low']:                                continue  # ⑦ candle must reach zone
+                if close < z['low']:                               continue  # ⑧ must close above zone floor
+                if close < open_:                                  continue  # ⑨ bullish candle
+                risk = close - z['low']
+                if risk <= 0 or risk > atr * self.MAX_RISK_ATR:   continue  # ⑩
+                candidates.append(z)
             if candidates:
-                # prefer youngest, then tightest zone
                 z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
                 print(
-                    f"  🔵 IFVG BUY  [{z['low']:.2f}–{z['high']:.2f}] "
+                    f"  🔵 IFVG BUY  [{z['low']:.3f}–{z['high']:.3f}] "
                     f"age={z['age']}  Discount  RSI={rsi:.0f}  EMA200={ema200:.2f}"
                 )
                 return 1, z['low']
 
-        # ── SELL setup ──
-        if in_premium and downtrend and rsi > 40:
-            candidates = [
-                z for z in ifvgs
-                if z['type'] == 'bear'
-                and z['age'] <= self.MAX_AGE
-                and z['width'] >= min_w
-                and low  <= z['high']                  # ① candle overlaps zone
-                and high >= z['low']
-                and close <= (z['low'] + z['high']) / 2  # ② closed below zone midpoint
-            ]
+        # ── SELL: checks ④⑤⑥ ──
+        if in_premium and downtrend and 45 <= rsi <= 80:
+            candidates = []
+            for z in ifvgs:
+                if z['type'] != 'bear':                            continue
+                if z['age'] > self.MAX_AGE:                        continue  # ②
+                if z['width'] < min_w:                             continue  # ①
+                if high < z['low']:                                continue  # ⑦ candle must enter zone
+                if low  > z['high']:                               continue  # ⑦ candle must reach zone
+                if close > z['high']:                              continue  # ⑧ must close below zone ceiling
+                if close > open_:                                  continue  # ⑨ bearish candle
+                risk = z['high'] - close
+                if risk <= 0 or risk > atr * self.MAX_RISK_ATR:   continue  # ⑩
+                candidates.append(z)
             if candidates:
                 z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
                 print(
-                    f"  🔴 IFVG SELL [{z['low']:.2f}–{z['high']:.2f}] "
+                    f"  🔴 IFVG SELL [{z['low']:.3f}–{z['high']:.3f}] "
                     f"age={z['age']}  Premium   RSI={rsi:.0f}  EMA200={ema200:.2f}"
                 )
                 return -1, z['high']
