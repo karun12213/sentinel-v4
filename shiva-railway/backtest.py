@@ -438,14 +438,18 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"   ⚠️  Daily EMA200 failed: {e}")
 
-    os.environ['SL_POINTS'] = '0.30'
-    os.environ['MIN_ATR']   = '0.0'
+    # 1h: BUY-only (SELL unreliable on hourly USOIL — whipsaw dominates)
+    # SL=0.50pt (1h bar range 0.5-1pt; 0.30pt = noise on hourly)  TP=3.0pt  RR 1:6
+    os.environ['SL_POINTS']    = '0.50'
+    os.environ['MIN_ATR']      = '0.0'
+    os.environ['ADX_MIN']      = '20'
+    os.environ['SELL_ENABLED'] = '0'
     trades_1h = run(
         df_1h,
-        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [Daily EMA200 macro filter]',
+        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [FVG+EMA_BOUNCE BUY-only | Daily EMA200 | SL=0.50pt]',
         initial_capital=100.0,
-        sl_pts=0.30,
-        tp_pts=1.80,
+        sl_pts=0.50,
+        tp_pts=3.00,
         cooldown_bars=1,
         max_daily_trades=9,
         strategy_list=[FVGScalpStrategy(), EMABounceStrategy()],
@@ -453,6 +457,8 @@ if __name__ == '__main__':
     )
 
     # ── 15m last 60 days ──
+    os.environ['ADX_MIN']      = '20'
+    os.environ['SELL_ENABLED'] = '1'   # restore for 15m (daily EMA200 handles sell direction)
     print("📊 Running 15m backtest (last 60 days — max yfinance supports for 15m)…\n")
     df_15m    = fetch('15m', period='60d')
     trades_15 = run(

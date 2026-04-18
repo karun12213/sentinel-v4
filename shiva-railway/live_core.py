@@ -442,24 +442,22 @@ class FVGScalpStrategy(BaseStrategy):
         uptrend   = close > ema200
         downtrend = close < ema200
 
-        sl_pts = float(os.getenv('SL_POINTS', '0.30'))
-        # Skip: too volatile (tightened 2.0→1.5 to catch crash days)
-        if atr > sl_pts * 1.5:  return 0, 0.0
-        # Skip: no trend (ADX < 20 = ranging market, skip)
-        if adx > 0 and adx < 20: return 0, 0.0
+        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
+        adx_min = float(os.getenv('ADX_MIN', '20'))
+        if atr > sl_pts * 1.5:           return 0, 0.0  # too volatile
+        if adx > 0 and adx < adx_min:   return 0, 0.0  # no trend
 
         bars = df.tail(self.LOOKBACK + 3)
         n    = len(bars.reset_index(drop=True))
         fvgs = self._find_fvgs(bars)
 
-        r_prev     = df.iloc[-2]
-        prev_close = float(r_prev['close'])
-        prev_ema20 = float(r_prev.get('EMA_20', close) or close)
+        r_prev      = df.iloc[-2]
+        prev_ema20  = float(r_prev.get('EMA_20', close) or close)
         ema20_slope = ema20 - prev_ema20
         ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
-        bar_mid    = (high + low) / 2.0
+        bar_mid     = (high + low) / 2.0
 
-        # BUY: FVG retest, uptrend, EMA20+EMA50 both rising, RSI 35–65 (momentum present, not extended)
+        # BUY: FVG retest in uptrend, EMA20+EMA50 rising, RSI 35–68
         if uptrend and 35 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bull':        continue
@@ -471,6 +469,9 @@ class FVGScalpStrategy(BaseStrategy):
                 if close < open_:               continue
                 print(f"  🟢 FVG SCALP BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
                 return 1, fvg['low']
+
+        if os.getenv('SELL_ENABLED', '1') == '0':
+            return 0, 0.0
 
         # SELL: bearish FVG retest, downtrend, EMA20+EMA50 both falling, RSI 50–75
         if downtrend and 50 < rsi < 75 and ema20_slope < 0 and ema50_slope <= 0 and close <= bar_mid:
@@ -523,11 +524,10 @@ class EMABounceStrategy(BaseStrategy):
         prev_close = float(prev['close'])
         prev_ema20 = float(prev.get('EMA_20', prev_close) or prev_close)
 
-        sl_pts = float(os.getenv('SL_POINTS', '0.30'))
-        # Skip: too volatile (tightened to 1.5× to catch crash/gap days)
-        if atr > sl_pts * 1.5:   return 0, 0.0
-        # Skip: no trend (ADX < 20 = ranging market)
-        if adx > 0 and adx < 20: return 0, 0.0
+        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
+        adx_min = float(os.getenv('ADX_MIN', '20'))
+        if atr > sl_pts * 1.5:           return 0, 0.0
+        if adx > 0 and adx < adx_min:   return 0, 0.0
 
         bar_mid   = (high + low) / 2.0
         uptrend   = close > ema200
@@ -535,7 +535,7 @@ class EMABounceStrategy(BaseStrategy):
         ema20_slope = ema20 - prev_ema20
         ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
 
-        # BUY: EMA20 bounce in uptrend, both EMA20+EMA50 rising, RSI 35–65
+        # BUY: EMA20 bounce in uptrend, EMA20+EMA50 rising, RSI 35–68
         if (uptrend and
                 35 < rsi < 65 and
                 ema20_slope > 0 and
@@ -548,7 +548,10 @@ class EMABounceStrategy(BaseStrategy):
             print(f"  🟦 EMA BOUNCE BUY  close={close:.3f} > EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
             return 1, wick
 
-        # SELL: EMA20 rejection in downtrend, both EMA20+EMA50 falling, RSI 50–75
+        if os.getenv('SELL_ENABLED', '1') == '0':
+            return 0, 0.0
+
+        # SELL: EMA20 rejection in downtrend, EMA20+EMA50 both falling, RSI 50–75
         if (downtrend and
                 50 < rsi < 75 and
                 ema20_slope < 0 and
