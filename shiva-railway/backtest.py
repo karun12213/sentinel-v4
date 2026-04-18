@@ -1,15 +1,19 @@
 """
-SHIVA V5 — IFVG + Discount/Premium Backtest
-Data: CL=F (WTI Crude / USOIL proxy) — daily bars 2018-2026
-      + 15m bars last 60 days (max yfinance allows for intraday)
-Strategy: IFVGStrategy from live_core.py (identical logic)
-SL: IFVG zone boundary | TP: 6R | Cooldown: 1 bar after close
+SHIVA V6 — IFVG + FVG Scalp Backtest
+Data: CL=F (WTI Crude / USOIL proxy)
+  - Daily bars 2018-2026 (full history)
+  - 15m bars last 60 days (max yfinance allows for intraday)
+Fixed: SL = $3 / TP = $18 (6:1 RR) at 0.01 lot (10 $/pt)
+       → SL = 0.30 pts, TP = 1.80 pts
+Daily limit: 9 trades/day
+Capital: $100
 """
 import sys, os, warnings
 warnings.filterwarnings('ignore')
 
 import pandas as pd
 import numpy as np
+from collections import defaultdict
 
 try:
     import yfinance as yf
@@ -17,7 +21,7 @@ except ImportError:
     print("pip install yfinance"); sys.exit(1)
 
 sys.path.insert(0, os.path.dirname(__file__))
-from live_core import FeatureEngine, IFVGStrategy
+from live_core import FeatureEngine, IFVGStrategy, FVGScalpStrategy, EMABounceStrategy
 
 
 # ─────────────────────────────────────────────
@@ -28,7 +32,6 @@ def fetch(interval: str, start: str = '2018-01-01') -> pd.DataFrame:
     df = yf.download('CL=F', start=start, interval=interval,
                      auto_adjust=True, progress=False, multi_level_index=False)
     if df is None or df.empty:
-        # fallback: period-based for intraday
         df = yf.download('CL=F', period='60d', interval=interval,
                          auto_adjust=True, progress=False, multi_level_index=False)
     df.columns = [c.lower() for c in df.columns]
@@ -42,107 +45,83 @@ def fetch(interval: str, start: str = '2018-01-01') -> pd.DataFrame:
 # BAR-BY-BAR EVENT-DRIVEN BACKTEST
 # ─────────────────────────────────────────────
 def run(df: pd.DataFrame, label: str,
-        initial_capital: float = 10_000.0,
-        lot_usd: float = 1_000.0,       # dollar value per lot (1 barrel ≈ $1 move per contract)
-        commission_pct: float = 0.0003,  # 0.03% round-trip
-        cooldown_bars: int = 1) -> pd.DataFrame:
+        initial_capital: float = 100.0,
+        sl_pts:  float = 0.30,   # $3 SL at 0.01 lot (10 $/pt)
+        tp_pts:  float = 1.80,   # $18 TP (6:1)
+        pt_usd:  float = 10.0,   # dollar value per 1 price point at 0.01 lot
+        commission_usd: float = 0.03,   # per round-trip
+        cooldown_bars: int = 1,
+        max_daily_trades: int = 9) -> pd.DataFrame:
 
-    strategy  = IFVGStrategy()
-    warmup    = max(strategy.ZONE_BARS, strategy.LOOKBACK) + 10
+    # FVG_SCALP + EMA_BOUNCE — IFVG excluded (uses dynamic ATR-based SL)
+    strategies = [FVGScalpStrategy(), EMABounceStrategy()]
+    warmup     = 210   # enough for EMA-200 + indicators
 
-    trades    = []
-    capital   = initial_capital
-    equity    = [initial_capital]
-    position  = None           # {side, entry, sl, tp, wick, entry_bar, entry_time, lot}
-    last_close_bar = -9999
+    trades           = []
+    capital          = initial_capital
+    equity           = [initial_capital]
+    position         = None
+    last_close_bar   = -9999
 
-    def _point():
-        return 0.01
+    # Daily trade counter
+    daily_counts     = defaultdict(int)   # date → count
 
-    def _snap(v, d='nearest'):
-        return round(v, 2)
-
-    def _build_levels(side, entry, wick):
-        buf   = 0.02
-        min_d = 0.10
-        if side == 'BUY':
-            sl   = min(wick - buf, entry - min_d)
-            sl   = _snap(sl)
-            risk = max(entry - sl, min_d)
-            tp   = _snap(entry + risk * 6)
-        else:
-            sl   = max(wick + buf, entry + min_d)
-            sl   = _snap(sl)
-            risk = max(sl - entry, min_d)
-            tp   = _snap(entry - risk * 6)
-        return sl, tp, risk
-
-    def _pnl(side, entry, exit_p, risk, lot_usd):
-        price_risk = risk
-        if price_risk == 0:
+    def _pnl_fixed(hit: str) -> float:
+        if hit == 'TP':
+            return round(pt_usd * tp_pts - commission_usd, 2)
+        elif hit == 'SL':
+            return round(-pt_usd * sl_pts - commission_usd, 2)
+        else:  # OPEN@END — mark-to-market
             return 0.0
-        # normalise to dollar PnL: 1 unit risk = lot_usd
+
+    def _pnl_mtm(side: str, entry: float, exit_p: float) -> float:
         move = (exit_p - entry) if side == 'BUY' else (entry - exit_p)
-        raw  = (move / price_risk) * lot_usd
-        comm = lot_usd * commission_pct
-        return round(raw - comm, 2)
+        return round(move * pt_usd - commission_usd, 2)
 
     for i in range(warmup, len(df)):
-        bar = df.iloc[i]
-        t   = df.index[i]
+        bar  = df.iloc[i]
+        t    = df.index[i]
+        date = t.date()
 
         # ── Check if open position hit SL or TP this bar ──
         if position is not None:
-            s    = position['side']
-            sl   = position['sl']
-            tp   = position['tp']
-            risk = position['risk']
-            hit  = None
+            s  = position['side']
+            sl = position['sl']
+            tp = position['tp']
+            hit = None
 
             if s == 'BUY':
-                # Assume: if open gaps past SL/TP, fill at that level
                 open_p = float(bar['open'])
-                if open_p <= sl:                           # gap below SL
-                    hit, exit_p = 'SL', open_p
-                elif open_p >= tp:                         # gap above TP
-                    hit, exit_p = 'TP', open_p
-                elif float(bar['low']) <= sl:              # SL touched intrabar
-                    hit, exit_p = 'SL', sl
-                elif float(bar['high']) >= tp:             # TP touched intrabar
-                    hit, exit_p = 'TP', tp
-            else:  # SELL
+                if   open_p <= sl:               hit, exit_p = 'SL', open_p
+                elif open_p >= tp:               hit, exit_p = 'TP', open_p
+                elif float(bar['low'])  <= sl:   hit, exit_p = 'SL', sl
+                elif float(bar['high']) >= tp:   hit, exit_p = 'TP', tp
+            else:
                 open_p = float(bar['open'])
-                if open_p >= sl:
-                    hit, exit_p = 'SL', open_p
-                elif open_p <= tp:
-                    hit, exit_p = 'TP', open_p
-                elif float(bar['high']) >= sl:
-                    hit, exit_p = 'SL', sl
-                elif float(bar['low']) <= tp:
-                    hit, exit_p = 'TP', tp
+                if   open_p >= sl:               hit, exit_p = 'SL', open_p
+                elif open_p <= tp:               hit, exit_p = 'TP', open_p
+                elif float(bar['high']) >= sl:   hit, exit_p = 'SL', sl
+                elif float(bar['low'])  <= tp:   hit, exit_p = 'TP', tp
 
             if hit:
-                pnl_val = _pnl(s, position['entry'], exit_p, risk, position['lot_usd'])
+                pnl_val = _pnl_fixed(hit)
                 capital += pnl_val
                 result   = 'WIN' if pnl_val > 0 else 'LOSS'
-
                 trades.append({
                     'trade_no':    len(trades) + 1,
+                    'date':        str(date),
                     'entry_time':  position['entry_time'],
                     'exit_time':   str(t),
+                    'strategy':    position['strategy'],
                     'side':        s,
                     'entry':       position['entry'],
                     'sl':          sl,
-                    'tp':          position['tp'],
-                    'wick':        position['wick'],
+                    'tp':          tp,
                     'exit':        exit_p,
                     'hit':         hit,
-                    'risk_pts':    round(risk, 3),
-                    'lot_usd':     position['lot_usd'],
                     'pnl':         pnl_val,
                     'capital':     round(capital, 2),
                     'result':      result,
-                    'ifvg_zone':   position.get('zone','?'),
                 })
                 last_close_bar = i
                 position = None
@@ -151,6 +130,10 @@ def run(df: pd.DataFrame, label: str,
 
         # ── Look for new entry ──
         if position is None and (i - last_close_bar) >= cooldown_bars:
+            # Daily limit check
+            if daily_counts[date] >= max_daily_trades:
+                continue
+
             window = df.iloc[:i + 1].copy()
             try:
                 feat = FeatureEngine.add_indicators(window)
@@ -159,57 +142,70 @@ def run(df: pd.DataFrame, label: str,
             if feat.empty:
                 continue
 
-            sig, wick = strategy.get_signal_and_wick(feat)
-            if sig == 0 or wick == 0.0:
+            # Try strategies in priority order
+            sig, wick, strat_name = 0, 0.0, ''
+            for strat in strategies:
+                s_sig, s_wick = strat.get_signal_and_wick(feat)
+                if s_sig != 0:
+                    sig, wick, strat_name = s_sig, s_wick, strat.name
+                    break
+
+            if sig == 0:
                 continue
 
-            entry = float(bar['close'])   # enter at bar close (conservative)
+            entry = float(bar['close'])
             side  = 'BUY' if sig == 1 else 'SELL'
-            sl, tp, risk = _build_levels(side, entry, wick)
 
-            # Reject if SL is unrealistically far (> 10% of price)
-            if risk / entry > 0.10:
-                continue
+            if side == 'BUY':
+                sl = round(entry - sl_pts, 2)
+                tp = round(entry + tp_pts, 2)
+            else:
+                sl = round(entry + sl_pts, 2)
+                tp = round(entry - tp_pts, 2)
 
-            zone = 'DISCOUNT' if sig == 1 else 'PREMIUM'
+            daily_counts[date] += 1
             position = {
-                'side': side, 'entry': entry, 'sl': sl, 'tp': tp,
-                'wick': wick, 'risk': risk, 'lot_usd': lot_usd,
-                'entry_bar': i, 'entry_time': str(t), 'zone': zone,
+                'side':       side,
+                'entry':      entry,
+                'sl':         sl,
+                'tp':         tp,
+                'wick':       wick,
+                'entry_bar':  i,
+                'entry_time': str(t),
+                'strategy':   strat_name,
             }
 
-    # Close any open position at last bar price
+    # Close any open position at last bar
     if position is not None:
         last_bar = df.iloc[-1]
         exit_p   = float(last_bar['close'])
-        pnl_val  = _pnl(position['side'], position['entry'], exit_p,
-                         position['risk'], position['lot_usd'])
+        pnl_val  = _pnl_mtm(position['side'], position['entry'], exit_p)
         capital += pnl_val
         trades.append({
             'trade_no':   len(trades) + 1,
+            'date':       str(df.index[-1].date()),
             'entry_time': position['entry_time'],
             'exit_time':  str(df.index[-1]),
+            'strategy':   position['strategy'],
             'side':       position['side'],
             'entry':      position['entry'],
             'sl':         position['sl'],
             'tp':         position['tp'],
-            'wick':       position['wick'],
             'exit':       exit_p,
             'hit':        'OPEN@END',
-            'risk_pts':   round(position['risk'], 3),
-            'lot_usd':    position['lot_usd'],
             'pnl':        pnl_val,
             'capital':    round(capital, 2),
             'result':     'WIN' if pnl_val > 0 else 'LOSS',
-            'ifvg_zone':  position.get('zone','?'),
         })
 
     trades_df = pd.DataFrame(trades)
 
     # ── Print summary ──
-    print(f"\n{'='*62}")
-    print(f"  BACKTEST  |  {label}  |  CL=F (USOIL)")
-    print(f"{'='*62}")
+    print(f"\n{'='*66}")
+    print(f"  BACKTEST  |  {label}")
+    print(f"  Fixed: SL={sl_pts}pt (${sl_pts*pt_usd:.0f})  TP={tp_pts}pt (${tp_pts*pt_usd:.0f})  RR=1:{tp_pts/sl_pts:.0f}")
+    print(f"  Capital ${initial_capital}  |  0.01 lot  |  Max {max_daily_trades} trades/day")
+    print(f"{'='*66}")
     if trades_df.empty:
         print("  No trades generated.")
         return trades_df
@@ -236,38 +232,54 @@ def run(df: pd.DataFrame, label: str,
     best     = trades_df['pnl'].max()
     worst    = trades_df['pnl'].min()
 
-    print(f"  Initial capital : ${initial_capital:,.2f}")
-    print(f"  Final capital   : ${capital:,.2f}")
-    print(f"  Net P&L         : ${net:+,.2f}  ({net/initial_capital*100:+.1f}%)")
-    print(f"  Total trades    : {n}")
-    print(f"  Wins / Losses   : {wins} / {losses}")
-    print(f"  Win rate        : {wr:.1%}")
-    print(f"  Profit factor   : {pf}")
-    print(f"  Avg win         : ${avg_win:+,.2f}")
-    print(f"  Avg loss        : ${avg_loss:+,.2f}")
-    print(f"  Best trade      : ${best:+,.2f}")
-    print(f"  Worst trade     : ${worst:+,.2f}")
-    print(f"  Max drawdown    : ${mdd:,.2f}")
-    print(f"  Max DD %        : {mdd/initial_capital*100:.1f}%")
+    # Trading days and per-day stats
+    active_days = len(daily_counts) if daily_counts else max(1, n)
+    trades_per_day = n / active_days
 
-    by_zone = trades_df.groupby('ifvg_zone').agg(
-        trades=('pnl','count'), wins=('result', lambda x: (x=='WIN').sum()),
-        pnl=('pnl','sum')
-    )
-    by_zone['wr'] = (by_zone['wins']/by_zone['trades']).map('{:.1%}'.format)
-    print(f"\n  By zone:")
-    print(by_zone[['trades','wins','wr','pnl']].to_string())
+    print(f"  Initial capital  : ${initial_capital:,.2f}")
+    print(f"  Final capital    : ${capital:,.2f}")
+    print(f"  Net P&L          : ${net:+,.2f}  ({net/initial_capital*100:+.1f}%)")
+    print(f"  Total trades     : {n}  |  Active days: {active_days}  |  Avg/day: {trades_per_day:.1f}")
+    print(f"  Wins / Losses    : {wins} / {losses}")
+    print(f"  Win rate         : {wr:.1%}  (breakeven = 14.3% at 6:1)")
+    print(f"  Profit factor    : {pf}")
+    print(f"  Avg win          : ${avg_win:+,.2f}")
+    print(f"  Avg loss         : ${avg_loss:+,.2f}")
+    print(f"  Best trade       : ${best:+,.2f}")
+    print(f"  Worst trade      : ${worst:+,.2f}")
+    print(f"  Max drawdown     : ${mdd:,.2f}  ({mdd/initial_capital*100:.1f}%)")
 
+    # By strategy
+    if 'strategy' in trades_df.columns:
+        by_strat = trades_df.groupby('strategy').agg(
+            trades=('pnl', 'count'),
+            wins=('result', lambda x: (x == 'WIN').sum()),
+            pnl=('pnl', 'sum'),
+        )
+        by_strat['wr'] = (by_strat['wins'] / by_strat['trades']).map('{:.1%}'.format)
+        print(f"\n  By strategy:")
+        print(by_strat[['trades', 'wins', 'wr', 'pnl']].to_string())
+
+    # By direction
     by_side = trades_df.groupby('side').agg(
-        trades=('pnl','count'), wins=('result', lambda x: (x=='WIN').sum()),
-        pnl=('pnl','sum')
+        trades=('pnl', 'count'),
+        wins=('result', lambda x: (x == 'WIN').sum()),
+        pnl=('pnl', 'sum'),
     )
-    by_side['wr'] = (by_side['wins']/by_side['trades']).map('{:.1%}'.format)
+    by_side['wr'] = (by_side['wins'] / by_side['trades']).map('{:.1%}'.format)
     print(f"\n  By direction:")
-    print(by_side[['trades','wins','wr','pnl']].to_string())
+    print(by_side[['trades', 'wins', 'wr', 'pnl']].to_string())
 
-    print(f"{'='*62}\n")
+    # Daily distribution
+    if 'date' in trades_df.columns:
+        day_counts_series = trades_df.groupby('date').size()
+        print(f"\n  Trades/day distribution:")
+        print(f"    Max: {day_counts_series.max()}  |  "
+              f"Min: {day_counts_series.min()}  |  "
+              f"Median: {day_counts_series.median():.1f}  |  "
+              f"Days hitting limit: {(day_counts_series >= max_daily_trades).sum()}")
 
+    print(f"{'='*66}\n")
     return trades_df
 
 
@@ -275,40 +287,53 @@ def run(df: pd.DataFrame, label: str,
 # MAIN
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
-    print("=" * 62)
-    print("  SHIVA V5 — IFVG + Discount/Premium BACKTEST")
-    print("  Asset: USOIL (CL=F WTI Crude Oil Futures)")
-    print("=" * 62)
+    print("=" * 66)
+    print("  SHIVA V6 — IFVG + FVG Scalp | Fixed $3 SL / $18 TP | $100 capital")
+    print("  Asset: USOIL (CL=F WTI Crude Oil Futures)  |  0.01 lot")
+    print("=" * 66)
     print()
 
-    # ── 1. Daily 2018-2026 (full history) ──
-    df_daily = fetch('1d', start='2018-01-01')
-    trades_d = run(df_daily, label='DAILY 2018→2026', cooldown_bars=1)
+    # ── 1. Daily 2018-2026 ──
+    df_daily  = fetch('1d', start='2018-01-01')
+    trades_d  = run(
+        df_daily,
+        label='DAILY 2018→2026',
+        initial_capital=100.0,
+        sl_pts=0.30,
+        tp_pts=1.80,
+        pt_usd=10.0,
+        cooldown_bars=1,
+        max_daily_trades=9,
+    )
 
-    # ── 2. 15-minute (last 60 days — max available) ──
-    df_15m   = fetch('15m')
-    trades_15 = run(df_15m, label='15m last 60 days', cooldown_bars=6, lot_usd=500.0)
+    # ── 2. 15m (last 60 days — max yfinance) ──
+    df_15m    = fetch('15m')
+    trades_15 = run(
+        df_15m,
+        label='15m last 60 days',
+        initial_capital=100.0,
+        sl_pts=0.30,
+        tp_pts=1.80,
+        pt_usd=10.0,
+        cooldown_bars=1,   # 15-min cooldown (matching live bot 5-min on 5m candles)
+        max_daily_trades=9,
+    )
 
-    # ── Save full trade logs ──
+    # ── Save & print daily trades ──
+    pd.set_option('display.width', 200)
+    pd.set_option('display.max_rows', None)
+
+    cols = ['trade_no', 'date', 'entry_time', 'exit_time', 'strategy',
+            'side', 'entry', 'sl', 'tp', 'exit', 'hit', 'pnl', 'capital', 'result']
+
     if not trades_d.empty:
-        out = 'backtest_daily_trades.csv'
-        trades_d.to_csv(out, index=False)
-        print(f"📝 Daily trade log → {out}  ({len(trades_d)} trades)")
-
-        # Print every single trade
-        print("\n─── ALL DAILY TRADES ────────────────────────────────────────────────────")
-        pd.set_option('display.width', 180)
-        pd.set_option('display.max_rows', None)
-        cols = ['trade_no','entry_time','exit_time','side','entry','sl','tp',
-                'wick','exit','hit','risk_pts','pnl','capital','result','ifvg_zone']
+        trades_d.to_csv('backtest_daily_trades.csv', index=False)
+        print(f"📝 Daily trade log → backtest_daily_trades.csv  ({len(trades_d)} trades)")
+        print("\n─── ALL DAILY TRADES ──────────────────────────────────────────────────────")
         print(trades_d[cols].to_string(index=False))
 
     if not trades_15.empty:
-        out2 = 'backtest_15m_trades.csv'
-        trades_15.to_csv(out2, index=False)
-        print(f"\n📝 15m trade log   → {out2}  ({len(trades_15)} trades)")
-
-        print("\n─── ALL 15m TRADES ─────────────────────────────────────────────────────")
-        cols = ['trade_no','entry_time','exit_time','side','entry','sl','tp',
-                'wick','exit','hit','risk_pts','pnl','capital','result','ifvg_zone']
+        trades_15.to_csv('backtest_15m_trades.csv', index=False)
+        print(f"\n📝 15m trade log   → backtest_15m_trades.csv  ({len(trades_15)} trades)")
+        print("\n─── ALL 15m TRADES ────────────────────────────────────────────────────────")
         print(trades_15[cols].to_string(index=False))

@@ -1,9 +1,8 @@
 """
-SHIVA V5 — SMC IFVG Trading System
-Entry: Inverse Fair Value Gap retests in Discount / Premium zones
-SL: IFVG zone boundary (wick level)
-TP: 6R
-Cooldown: 6 minutes after any SL/TP hit before next entry
+SHIVA V6 — IFVG + FVG Scalp | Fixed SL/TP | Max 9 trades/day
+Entry: IFVG zone retests (quality) + Fresh FVG scalp (frequency)
+SL: Fixed $3 / TP: Fixed $18 (6:1 RR) at 0.01 lot
+Daily limit: MAX_DAILY_TRADES (default 9)
 """
 import asyncio
 import json
@@ -46,26 +45,27 @@ def _discord_post(webhook_url: str, payload: dict):
 
 
 def discord_trade_open(side: str, symbol: str, entry: float,
-                       sl: float, tp: float, lot: float, zone: str, wick: float):
+                       sl: float, tp: float, lot: float, zone: str, wick: float,
+                       strategy_name: str = '', day_count: int = 0, max_day: int = 9):
     webhook = os.getenv('DISCORD_TRADES') or os.getenv('DISCORD_ALERTS', '')
     risk    = abs(entry - sl)
     reward  = abs(tp - entry)
     emoji   = '🚀' if side == 'BUY' else '📉'
     color   = 0x00FF88 if side == 'BUY' else 0xFF4444
-    _discord_post(webhook, {"embeds": [{"title": f"{emoji} {side}  {symbol}",
+    _discord_post(webhook, {"embeds": [{"title": f"{emoji} {side}  {symbol}  [{day_count}/{max_day} today]",
         "color": color,
         "fields": [
-            {"name": "Entry",   "value": f"`{entry:.2f}`",  "inline": True},
-            {"name": "SL",      "value": f"`{sl:.2f}`",     "inline": True},
-            {"name": "TP",      "value": f"`{tp:.2f}`",     "inline": True},
-            {"name": "Risk",    "value": f"`{risk:.2f}`",   "inline": True},
-            {"name": "Reward",  "value": f"`{reward:.2f}`", "inline": True},
-            {"name": "R:R",     "value": f"`1 : {reward/risk:.1f}`" if risk else "`—`", "inline": True},
-            {"name": "Lot",     "value": f"`{lot}`",        "inline": True},
-            {"name": "Zone",    "value": f"`{zone}`",       "inline": True},
-            {"name": "Wick SL", "value": f"`{wick:.2f}`",  "inline": True},
+            {"name": "Entry",    "value": f"`{entry:.2f}`",       "inline": True},
+            {"name": "SL",       "value": f"`{sl:.2f}`",          "inline": True},
+            {"name": "TP",       "value": f"`{tp:.2f}`",          "inline": True},
+            {"name": "Risk pts", "value": f"`{risk:.2f}`",        "inline": True},
+            {"name": "Reward",   "value": f"`{reward:.2f}`",      "inline": True},
+            {"name": "R:R",      "value": f"`1 : {reward/risk:.1f}`" if risk else "`—`", "inline": True},
+            {"name": "Lot",      "value": f"`{lot}`",             "inline": True},
+            {"name": "Zone",     "value": f"`{zone}`",            "inline": True},
+            {"name": "Strategy", "value": f"`{strategy_name}`",   "inline": True},
         ],
-        "footer": {"text": "SHIVA V5 — IFVG SMC"},
+        "footer": {"text": "SHIVA V6 — IFVG+FVG Scalp"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }]})
 
@@ -82,7 +82,7 @@ def discord_trade_close(side: str, symbol: str, entry: float,
             {"name": "Exit",   "value": f"`{exit_price:.2f}`", "inline": True},
             {"name": "PnL",    "value": f"`${pnl:.2f}`",       "inline": True},
         ],
-        "footer": {"text": "SHIVA V5 — IFVG SMC"},
+        "footer": {"text": "SHIVA V6 — IFVG+FVG Scalp"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }]})
 
@@ -103,7 +103,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain; charset=utf-8')
             self.end_headers()
-            self.wfile.write(b'OK - SHIVA V5 LIVE')
+            self.wfile.write(b'OK - SHIVA V6 LIVE')
 
     def log_message(self, *_):
         return
@@ -134,17 +134,16 @@ class FeatureEngine:
     @staticmethod
     def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        # Normalise column names (MetaApi may return camelCase)
         df.columns = [c.lower() for c in df.columns]
         for alias, canon in [('tickvolume', 'volume'), ('brokertime', 'time')]:
             if alias in df.columns and canon not in df.columns:
                 df.rename(columns={alias: canon}, inplace=True)
 
-        df['RSI'] = ta.rsi(df['close'], length=14)
-        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['EMA_20']  = ta.ema(df['close'], length=20)
-        df['EMA_50']  = ta.ema(df['close'], length=50)
-        df['EMA_200'] = ta.ema(df['close'], length=200)
+        df['RSI']    = ta.rsi(df['close'], length=14)
+        df['ATR']    = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['EMA_20'] = ta.ema(df['close'], length=20)
+        df['EMA_50'] = ta.ema(df['close'], length=50)
+        df['EMA_200']= ta.ema(df['close'], length=200)
 
         try:
             bb = ta.bbands(df['close'], length=20, std=2)
@@ -166,9 +165,6 @@ class FeatureEngine:
 # BASE STRATEGY
 # ─────────────────────────────────────────────
 class BaseStrategy(ABC):
-    MIN_TRADES = 999999
-    DISABLE_WR  = 0.0
-
     def __init__(self, name: str):
         self.name    = name
         self.enabled = True
@@ -193,9 +189,6 @@ class BaseStrategy(ABC):
     @property
     def net_pnl(self): return sum(t['pnl'] for t in self.trades)
 
-    @property
-    def weight(self): return 1.0
-
     def record_trade(self, pnl: float):
         self.trades.append({'pnl': pnl, 'time': datetime.now(timezone.utc).isoformat()})
 
@@ -210,59 +203,39 @@ class BaseStrategy(ABC):
         }
 
     @abstractmethod
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        """Return (+1=BUY / -1=SELL / 0=HOLD, wick_price)"""
+
     def generate_signal(self, df: pd.DataFrame) -> int:
-        """Return +1=BUY, -1=SELL, 0=HOLD"""
+        sig, _ = self.get_signal_and_wick(df)
+        return sig
 
 
 # ─────────────────────────────────────────────
-# IFVG + DISCOUNT/PREMIUM STRATEGY  (v3 — fully optimised)
+# IFVG + DISCOUNT/PREMIUM STRATEGY  (quality — high conviction)
 # ─────────────────────────────────────────────
 class IFVGStrategy(BaseStrategy):
     """
-    10-point entry checklist — ALL must pass:
-
-    ZONE QUALITY
-    ① Zone width ≥ MIN_WIDTH_PCT of price  (no noise zones)
-    ② IFVG age ≤ MAX_AGE bars             (fresh zones only)
-    ③ Zone not invalidated after formation:
-         Bullish IFVG → price never closed below zone.low after IFVG formed
-         Bearish IFVG → price never closed above zone.high after IFVG formed
-
-    CONTEXT
-    ④ EMA-200 trend alignment:
-         BUY  → close > EMA-200  (pullback in uptrend)
-         SELL → close < EMA-200  (bounce in downtrend)
-    ⑤ Discount/Premium zone:
-         BUY  → close < range midpoint  (discount)
-         SELL → close > range midpoint  (premium)
-    ⑥ RSI in valid range:
-         BUY  → RSI 20–55  (neutral/oversold only)
-         SELL → RSI 45–80  (neutral/overbought only)
-
-    CANDLE TRIGGER (zone touch + reversal)
-    ⑦ Candle enters IFVG zone from the correct side:
-         BUY  → bar low  ≤ zone.high  (candle dipped into bullish zone)
-         SELL → bar high ≥ zone.low   (candle rallied into bearish zone)
-    ⑧ Candle body confirms zone HELD:
-         BUY  → close ≥ zone.low   (closed above zone floor — zone supported)
-         SELL → close ≤ zone.high  (closed below zone ceiling — zone resisted)
-    ⑨ Candle body direction:
-         BUY  → close ≥ open  (bullish rejection bar)
-         SELL → close ≤ open  (bearish rejection bar)
-
-    RISK
-    ⑩ Risk ≤ 1.5 × ATR  (rejects entries with overly wide SL)
+    10-point checklist (all must pass):
+    ① Zone width ≥ 0.2% of price
+    ② IFVG age ≤ 20 bars
+    ③ Zone not invalidated post-formation
+    ④ EMA-200 trend alignment
+    ⑤ Discount (BUY) / Premium (SELL) zone
+    ⑥ RSI range (BUY 20-55, SELL 45-80)
+    ⑦ Candle enters IFVG zone from correct side
+    ⑧ Candle body confirms zone held
+    ⑨ Bullish/bearish rejection candle
+    ⑩ Risk ≤ 1.5 × ATR
     """
-    LOOKBACK      = 50    # bars to scan for FVGs
-    ZONE_BARS     = 100   # bars for swing range
-    MAX_AGE       = 20    # max bars since IFVG formed (fresh only)
-    MIN_WIDTH_PCT = 0.002 # zone ≥ 0.2% of price (filters micro-noise)
-    MAX_RISK_ATR  = 1.5   # SL risk capped at 1.5 × ATR
+    LOOKBACK      = 50
+    ZONE_BARS     = 100
+    MAX_AGE       = 20
+    MIN_WIDTH_PCT = 0.002
+    MAX_RISK_ATR  = 1.5
 
     def __init__(self):
         super().__init__("IFVG_SMC")
-
-    # ── FVG detection ──
 
     def _find_fvgs(self, bars: pd.DataFrame) -> list[dict]:
         bars = bars.reset_index(drop=True)
@@ -280,13 +253,6 @@ class IFVGStrategy(BaseStrategy):
         return fvgs
 
     def _get_ifvgs(self, df: pd.DataFrame) -> list[dict]:
-        """
-        Detects IFVGs with full invalidation check:
-          Bullish FVG filled → bearish IFVG (resistance)
-            → invalidated if a subsequent close > zone.high
-          Bearish FVG filled → bullish IFVG (support)
-            → invalidated if a subsequent close < zone.low
-        """
         bars  = df.reset_index(drop=True)
         n     = len(bars)
         fvgs  = self._find_fvgs(bars)
@@ -300,28 +266,23 @@ class IFVGStrategy(BaseStrategy):
             age   = n - 1 - fvg['idx']
 
             if fvg['type'] == 'bull':
-                # Bullish FVG filled when price trades below fvg.low
                 fill_mask = after['low'] <= fvg['low']
                 if not fill_mask.any():
                     continue
-                fill_pos  = fill_mask.idxmax()            # first bar that fills it
-                post_fill = bars.loc[fill_pos + 1:]       # bars after fill
-                # Invalidated if price closes above zone.high after becoming bearish IFVG
+                fill_pos  = fill_mask.idxmax()
+                post_fill = bars.loc[fill_pos + 1:]
                 if not post_fill.empty and float(post_fill['close'].max()) > fvg['high']:
                     continue
                 ifvgs.append({
                     'type': 'bear', 'low': fvg['low'], 'high': fvg['high'],
                     'age': age, 'width': fvg['high'] - fvg['low'],
                 })
-
-            else:  # bearish FVG
-                # Bearish FVG filled when price trades above fvg.high
+            else:
                 fill_mask = after['high'] >= fvg['high']
                 if not fill_mask.any():
                     continue
                 fill_pos  = fill_mask.idxmax()
                 post_fill = bars.loc[fill_pos + 1:]
-                # Invalidated if price closes below zone.low after becoming bullish IFVG
                 if not post_fill.empty and float(post_fill['close'].min()) < fvg['low']:
                     continue
                 ifvgs.append({
@@ -331,19 +292,12 @@ class IFVGStrategy(BaseStrategy):
 
         return ifvgs
 
-    # ── signal ──
-
     def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
-        """
-        Returns (signal, wick_price) or (0, 0.0) when no valid setup.
-        wick_price = SL anchor (zone.low for BUY, zone.high for SELL).
-        """
         if len(df) < self.ZONE_BARS + 5:
             return 0, 0.0
 
-        r    = df.iloc[-1]
-        prev = df.iloc[-2]
-        atr  = float(r.get('ATR', 0) or 0)
+        r      = df.iloc[-1]
+        atr    = float(r.get('ATR', 0) or 0)
         if atr == 0:
             return 0, 0.0
 
@@ -354,11 +308,9 @@ class IFVGStrategy(BaseStrategy):
         ema200 = float(r.get('EMA_200', close) or close)
         rsi    = float(r.get('RSI', 50) or 50)
 
-        # ④ EMA-200 trend alignment
         uptrend   = close > ema200
         downtrend = close < ema200
 
-        # ⑤ Discount / Premium zone
         zone_df    = df.tail(self.ZONE_BARS)
         swing_high = float(zone_df['high'].max())
         swing_low  = float(zone_df['low'].min())
@@ -369,55 +321,206 @@ class IFVGStrategy(BaseStrategy):
         ifvgs = self._get_ifvgs(df.tail(self.LOOKBACK + 3))
         min_w = close * self.MIN_WIDTH_PCT
 
-        # ── BUY: checks ④⑤⑥ ──
         if in_discount and uptrend and 20 <= rsi <= 55:
             candidates = []
             for z in ifvgs:
-                if z['type'] != 'bull':                            continue
-                if z['age'] > self.MAX_AGE:                        continue  # ②
-                if z['width'] < min_w:                             continue  # ①
-                if low  > z['high']:                               continue  # ⑦ candle must enter zone
-                if high < z['low']:                                continue  # ⑦ candle must reach zone
-                if close < z['low']:                               continue  # ⑧ must close above zone floor
-                if close < open_:                                  continue  # ⑨ bullish candle
+                if z['type'] != 'bull':                          continue
+                if z['age'] > self.MAX_AGE:                      continue
+                if z['width'] < min_w:                           continue
+                if low  > z['high']:                             continue
+                if high < z['low']:                              continue
+                if close < z['low']:                             continue
+                if close < open_:                                continue
                 risk = close - z['low']
-                if risk <= 0 or risk > atr * self.MAX_RISK_ATR:   continue  # ⑩
+                if risk <= 0 or risk > atr * self.MAX_RISK_ATR: continue
                 candidates.append(z)
             if candidates:
                 z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
-                print(
-                    f"  🔵 IFVG BUY  [{z['low']:.3f}–{z['high']:.3f}] "
-                    f"age={z['age']}  Discount  RSI={rsi:.0f}  EMA200={ema200:.2f}"
-                )
+                print(f"  🔵 IFVG BUY  [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Discount  RSI={rsi:.0f}")
                 return 1, z['low']
 
-        # ── SELL: checks ④⑤⑥ ──
         if in_premium and downtrend and 45 <= rsi <= 80:
             candidates = []
             for z in ifvgs:
-                if z['type'] != 'bear':                            continue
-                if z['age'] > self.MAX_AGE:                        continue  # ②
-                if z['width'] < min_w:                             continue  # ①
-                if high < z['low']:                                continue  # ⑦ candle must enter zone
-                if low  > z['high']:                               continue  # ⑦ candle must reach zone
-                if close > z['high']:                              continue  # ⑧ must close below zone ceiling
-                if close > open_:                                  continue  # ⑨ bearish candle
+                if z['type'] != 'bear':                          continue
+                if z['age'] > self.MAX_AGE:                      continue
+                if z['width'] < min_w:                           continue
+                if high < z['low']:                              continue
+                if low  > z['high']:                             continue
+                if close > z['high']:                            continue
+                if close > open_:                                continue
                 risk = z['high'] - close
-                if risk <= 0 or risk > atr * self.MAX_RISK_ATR:   continue  # ⑩
+                if risk <= 0 or risk > atr * self.MAX_RISK_ATR: continue
                 candidates.append(z)
             if candidates:
                 z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
-                print(
-                    f"  🔴 IFVG SELL [{z['low']:.3f}–{z['high']:.3f}] "
-                    f"age={z['age']}  Premium   RSI={rsi:.0f}  EMA200={ema200:.2f}"
-                )
+                print(f"  🔴 IFVG SELL [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Premium   RSI={rsi:.0f}")
                 return -1, z['high']
 
         return 0, 0.0
 
-    def generate_signal(self, df: pd.DataFrame) -> int:
-        signal, _ = self.get_signal_and_wick(df)
-        return signal
+
+# ─────────────────────────────────────────────
+# FVG SCALP STRATEGY  (frequency — generates more signals)
+# ─────────────────────────────────────────────
+class FVGScalpStrategy(BaseStrategy):
+    """
+    Fresh unmitigated FVG first-touch scalp.
+    Requires EMA-200 trend alignment + reversal candle.
+    Age ≤ 5 bars (very fresh zones only, no re-entry).
+    Designed for 5m candles to generate ~9 signals/day.
+    """
+    LOOKBACK = 40
+    MAX_AGE  = 5    # only take the very first touch
+
+    def __init__(self):
+        super().__init__("FVG_SCALP")
+
+    def _find_fvgs(self, bars: pd.DataFrame) -> list[dict]:
+        bars = bars.reset_index(drop=True)
+        n    = len(bars)
+        fvgs = []
+        for i in range(1, n - 1):
+            ph = float(bars.iloc[i - 1]['high'])
+            pl = float(bars.iloc[i - 1]['low'])
+            nh = float(bars.iloc[i + 1]['high'])
+            nl = float(bars.iloc[i + 1]['low'])
+            if ph < nl:
+                fvgs.append({'type': 'bull', 'low': ph, 'high': nl, 'idx': i})
+            if pl > nh:
+                fvgs.append({'type': 'bear', 'low': nh, 'high': pl, 'idx': i})
+        return fvgs
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < 60:
+            return 0, 0.0
+
+        r      = df.iloc[-1]
+        close  = float(r['close'])
+        open_  = float(r['open'])
+        high   = float(r['high'])
+        low    = float(r['low'])
+        ema200 = float(r.get('EMA_200', close) or close)
+        rsi    = float(r.get('RSI', 50) or 50)
+
+        ema20  = float(r.get('EMA_20', close) or close)
+        atr    = float(r.get('ATR', 0) or 0)
+        uptrend   = close > ema200
+        downtrend = close < ema200
+
+        # Skip when volatility is too high for fixed SL (ATR > 2× SL points)
+        sl_pts = float(os.getenv('SL_POINTS', '0.30'))
+        if atr > sl_pts * 2.0:
+            return 0, 0.0
+
+        bars = df.tail(self.LOOKBACK + 3)
+        n    = len(bars.reset_index(drop=True))
+        fvgs = self._find_fvgs(bars)
+
+        r_prev     = df.iloc[-2]
+        prev_close = float(r_prev['close'])
+        prev_ema20 = float(r_prev.get('EMA_20', close) or close)
+        ema20_slope = ema20 - prev_ema20   # positive = EMA20 rising, negative = falling
+        bar_mid    = (high + low) / 2.0
+
+        # BUY: bullish FVG retest in uptrend, EMA20 rising, strong close above bar mid
+        if uptrend and rsi < 65 and ema20_slope > 0 and close >= bar_mid:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bull':        continue
+                age = n - 1 - fvg['idx']
+                if age > self.MAX_AGE:           continue
+                if age < 1:                      continue
+                if low  > fvg['high']:           continue  # didn't enter zone
+                if close < fvg['low']:           continue  # broke through zone — skip
+                if close < open_:               continue  # need bullish close
+                print(f"  🟢 FVG SCALP BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
+                return 1, fvg['low']
+
+        # SELL: bearish FVG retest in downtrend, EMA20 falling, RSI > 50 (not yet oversold)
+        if downtrend and 50 < rsi < 80 and ema20_slope < 0 and close <= bar_mid:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bear':        continue
+                age = n - 1 - fvg['idx']
+                if age > self.MAX_AGE:           continue
+                if age < 1:                      continue
+                if high < fvg['low']:            continue  # didn't reach zone
+                if close > fvg['high']:          continue  # broke through zone — skip
+                if close > open_:               continue  # need bearish close
+                print(f"  🔴 FVG SCALP SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
+                return -1, fvg['high']
+
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
+# EMA BOUNCE STRATEGY  (frequency — EMA20 dynamic S/R crosses)
+# ─────────────────────────────────────────────
+class EMABounceStrategy(BaseStrategy):
+    """
+    EMA20 dynamic support/resistance bounce.
+    BUY:  prev close < EMA20, current close > EMA20 + bullish candle (uptrend)
+    SELL: prev close > EMA20, current close < EMA20 + bearish candle (downtrend)
+    ATR filter same as FVGScalpStrategy.
+    Provides 3-5 extra signals per day on 5m.
+    """
+    def __init__(self):
+        super().__init__("EMA_BOUNCE")
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < 60:
+            return 0, 0.0
+
+        r    = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        close  = float(r['close'])
+        open_  = float(r['open'])
+        high   = float(r['high'])
+        low    = float(r['low'])
+        ema20  = float(r.get('EMA_20', close) or close)
+        ema200 = float(r.get('EMA_200', close) or close)
+        atr    = float(r.get('ATR', 0) or 0)
+        rsi    = float(r.get('RSI', 50) or 50)
+
+        prev_close = float(prev['close'])
+        prev_ema20 = float(prev.get('EMA_20', prev_close) or prev_close)
+
+        # Skip high-volatility bars
+        sl_pts = float(os.getenv('SL_POINTS', '0.30'))
+        if atr > sl_pts * 2.0:
+            return 0, 0.0
+
+        bar_mid = (high + low) / 2.0
+        uptrend   = close > ema200
+        downtrend = close < ema200
+
+        ema20_slope = ema20 - prev_ema20   # EMA20 direction filter
+
+        # BUY: bounced off EMA20 in uptrend, EMA20 slope rising
+        if (uptrend and
+                ema20_slope > 0 and           # EMA20 rising (confirmed uptrend)
+                prev_close < prev_ema20 and   # previous bar below EMA20
+                close > ema20 and             # current bar crossed back above
+                close > open_ and             # bullish body
+                close >= bar_mid and          # strong close
+                rsi < 65):
+            wick = low
+            print(f"  🟦 EMA BOUNCE BUY  close={close:.3f} > EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}")
+            return 1, wick
+
+        # SELL: rejected at EMA20 in downtrend, RSI > 50 (not already oversold = crash mode)
+        if (downtrend and
+                ema20_slope < 0 and           # EMA20 falling (confirmed downtrend)
+                prev_close > prev_ema20 and   # previous bar above EMA20
+                close < ema20 and             # current bar crossed back below
+                close < open_ and             # bearish body
+                close <= bar_mid and          # strong close
+                50 < rsi < 80):              # RSI above 50 = momentum still elevated
+            wick = high
+            print(f"  🟧 EMA BOUNCE SELL close={close:.3f} < EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}")
+            return -1, wick
+
+        return 0, 0.0
 
 
 # ─────────────────────────────────────────────
@@ -428,14 +531,15 @@ class MetaController:
         self.strategies   = strategies
         self._last_report = 0.0
 
-    def get_signal(self, df: pd.DataFrame) -> tuple[int, str]:
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float, str]:
+        """Returns (signal, wick, strategy_name)"""
         for s in self.strategies:
             if not s.enabled:
                 continue
-            sig = s.generate_signal(df)
+            sig, wick = s.get_signal_and_wick(df)
             if sig != 0:
-                return sig, s.name
-        return 0, ''
+                return sig, wick, s.name
+        return 0, 0.0, ''
 
     def report(self):
         now = time.time()
@@ -529,7 +633,7 @@ class AnalyticsEngine:
 # EXECUTION ENGINE
 # ─────────────────────────────────────────────
 class ExecutionEngine:
-    COOLDOWN_SECS = 360   # 6 minutes after SL/TP before next entry
+    COOLDOWN_SECS = 300  # 5 min after each trade (allows ~9-12/day)
 
     def __init__(self, token: str, account_id: str, symbol: str = "USOIL"):
         self.token      = token
@@ -537,8 +641,11 @@ class ExecutionEngine:
         self.symbol     = symbol
         self.is_running = True
 
-        self.ifvg_strategy = IFVGStrategy()
-        self.meta          = MetaController([self.ifvg_strategy])
+        # Strategies: FVG_SCALP (quality zones) + EMA_BOUNCE (frequency)
+        # IFVG_SMC excluded in fixed-SL mode (designed for dynamic ATR-based SL)
+        self.fvg_scalp     = FVGScalpStrategy()
+        self.ema_bounce    = EMABounceStrategy()
+        self.meta          = MetaController([self.fvg_scalp, self.ema_bounce])
         self.analytics     = AnalyticsEngine()
 
         self.connection  = None
@@ -549,9 +656,21 @@ class ExecutionEngine:
         self.tracked: dict[str, str] = {}
         self.last_close_time: float  = 0.0
 
+        # Daily trade counter
+        self.max_daily_trades = int(os.getenv('MAX_DAILY_TRADES', '9'))
+        self.daily_trades     = 0
+        self.daily_reset_date = datetime.now(timezone.utc).date()
+
     def stop(self, *_):
         self.is_running = False
         print("🛑 Shutdown signal received")
+
+    def _check_daily_reset(self):
+        today = datetime.now(timezone.utc).date()
+        if today != self.daily_reset_date:
+            print(f"📅 New trading day ({today}) — daily counter reset (was {self.daily_trades} trades)")
+            self.daily_trades     = 0
+            self.daily_reset_date = today
 
     # ── broker helpers ──
 
@@ -598,24 +717,34 @@ class ExecutionEngine:
 
     def _build_levels(self, side: str, entry: float, wick: float):
         """
-        wick = IFVG zone boundary used as SL anchor.
-        BUY:  SL just below wick (IFVG low), TP = entry + 6 * risk
-        SELL: SL just above wick (IFVG high), TP = entry - 6 * risk
+        Fixed SL/TP mode: uses SL_POINTS env var (default 0.30 pts for $3 at 0.01 lot).
+        Falls back to IFVG wick-based dynamic SL if SL_POINTS not set.
         """
-        min_d = self._min_stop()
-        buf   = self._point()
+        sl_pts  = float(os.getenv('SL_POINTS',  '0.30'))
+        tp_mult = float(os.getenv('TP_MULT',    '6.0'))
+        min_d   = self._min_stop()
+
+        if sl_pts > 0:
+            if side == 'BUY':
+                sl = self._snap(entry - max(sl_pts, min_d), 'down')
+                tp = self._snap(entry + sl_pts * tp_mult,   'up')
+            else:
+                sl = self._snap(entry + max(sl_pts, min_d), 'up')
+                tp = self._snap(entry - sl_pts * tp_mult,   'down')
+            return sl, tp
+
+        # Dynamic fallback (IFVG boundary)
+        buf = self._point()
         if side == 'BUY':
             desired_sl = wick - buf
-            sl         = min(desired_sl, entry - min_d)
-            sl         = self._snap(sl, 'down')
-            risk       = max(entry - sl, min_d)
-            tp         = self._snap(entry + risk * 6, 'up')
+            sl   = self._snap(min(desired_sl, entry - min_d), 'down')
+            risk = max(entry - sl, min_d)
+            tp   = self._snap(entry + risk * tp_mult, 'up')
         else:
             desired_sl = wick + buf
-            sl         = max(desired_sl, entry + min_d)
-            sl         = self._snap(sl, 'up')
-            risk       = max(sl - entry, min_d)
-            tp         = self._snap(entry - risk * 6, 'down')
+            sl   = self._snap(max(desired_sl, entry + min_d), 'up')
+            risk = max(sl - entry, min_d)
+            tp   = self._snap(entry - risk * tp_mult, 'down')
         return sl, tp
 
     # ── closed-position detection ──
@@ -657,23 +786,22 @@ class ExecutionEngine:
             result = "WIN ✅" if pnl > 0 else "LOSS ❌"
             print(
                 f"📊 Position closed | {result} | PnL=${pnl:.2f} | "
-                f"Cooldown: next entry in {self.COOLDOWN_SECS // 60} min"
+                f"Daily: {self.daily_trades}/{self.max_daily_trades} | "
+                f"Cooldown: {self.COOLDOWN_SECS // 60} min"
             )
-            # Find entry price from analytics for Discord close message
-            rec = next((r for r in self.analytics.records
-                        if r['position_id'] == pos_id), None)
+            rec = next((r for r in self.analytics.records if r['position_id'] == pos_id), None)
             entry_price = rec['entry'] if rec else 0.0
             side        = rec['side']  if rec else '?'
             discord_trade_close(side, self.symbol, entry_price, exit_price, pnl)
 
         self.meta.report()
 
-    # ── candle fetch (account-level REST, works with RPC connection) ──
+    # ── candle fetch ──
 
     async def _fetch_candles(self) -> pd.DataFrame:
-        start_time = datetime.now(timezone.utc) - timedelta(days=10)
+        start_time = datetime.now(timezone.utc) - timedelta(days=5)
         candles = await self.account.get_historical_candles(
-            self.symbol, '15m', start_time, 500
+            self.symbol, '5m', start_time, 500
         )
         if not candles:
             raise RuntimeError('No candles returned')
@@ -683,7 +811,7 @@ class ExecutionEngine:
     # ── main loop ──
 
     async def run(self):
-        print(f"🔱 SHIVA V5 LIVE | {self.symbol} | IFVG + Discount/Premium")
+        print(f"🔱 SHIVA V6 LIVE | {self.symbol} | IFVG + FVG Scalp | Max {self.max_daily_trades}/day")
         self.api = MetaApi(self.token)
         try:
             self.account = await self.api.metatrader_account_api.get_account(self.account_id)
@@ -692,70 +820,77 @@ class ExecutionEngine:
             await self.connection.connect()
             await self.connection.wait_synchronized()
             await self._refresh_spec()
+
+            sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
+            tp_mult = float(os.getenv('TP_MULT', '6.0'))
             print(
-                f"✅ MetaApi synchronized | {self.symbol} | "
-                f"Server: {getattr(self.account, 'server', '?')} | "
-                f"Login: {getattr(self.account, 'login', '?')}"
+                f"✅ MetaApi synchronized | {self.symbol}\n"
+                f"── Strategy ──────────────────────────────────────────\n"
+                f"  [1] IFVG_SMC   — high conviction zone retests\n"
+                f"  [2] FVG_SCALP  — fresh FVG first-touch scalp\n"
+                f"  Fixed SL: {sl_pts} pts | TP: {sl_pts * tp_mult:.2f} pts ({tp_mult:.0f}R)\n"
+                f"  Daily limit: {self.max_daily_trades} trades | Cooldown: {self.COOLDOWN_SECS // 60} min\n"
+                f"─────────────────────────────────────────────────────\n"
             )
-            print("\n── Strategy ─────────────────────────────────────────")
-            print("  [ACTIVE] IFVG_SMC  (Inverse FVG + Discount/Premium)")
-            print("  SL: IFVG zone boundary (wick)  |  TP: 6R")
-            print(f"  Cooldown after SL/TP: {self.COOLDOWN_SECS // 60} min")
-            print("─────────────────────────────────────────────────────\n")
+
+            lot = float(os.getenv('LOT_SIZE', '0.01'))
 
             while self.is_running:
                 try:
-                    # 1. Candles + indicators
+                    self._check_daily_reset()
+
                     df = await self._fetch_candles()
                     if df.empty:
                         raise RuntimeError('Empty indicator frame')
 
-                    # 2. Live positions
                     positions = await self.connection.get_positions()
                     live_ids  = {p['id'] for p in positions}
                     current   = next((p for p in positions if p['symbol'] == self.symbol), None)
 
-                    # 3. Detect closed positions
                     await self._process_closed_positions(live_ids)
 
-                    # 4. Cooldown check
+                    # Cooldown after last trade
                     secs_since_close = time.time() - self.last_close_time
                     in_cooldown = self.last_close_time > 0 and secs_since_close < self.COOLDOWN_SECS
                     if in_cooldown and not current:
                         remaining = int(self.COOLDOWN_SECS - secs_since_close)
-                        print(f"⏳ Cooldown — next entry in {remaining}s")
+                        print(f"⏳ Cooldown — next entry in {remaining}s  |  Daily: {self.daily_trades}/{self.max_daily_trades}")
                         await asyncio.sleep(30)
                         continue
 
-                    # 5. Signal from IFVG strategy
-                    if not current:
-                        signal, wick = self.ifvg_strategy.get_signal_and_wick(df)
-                    else:
-                        signal, wick = 0, 0.0
+                    # Daily limit check
+                    if self.daily_trades >= self.max_daily_trades:
+                        print(f"🚫 Daily limit reached ({self.daily_trades}/{self.max_daily_trades}) — waiting for next day")
+                        await asyncio.sleep(300)
+                        continue
 
-                    # 6. Execute
-                    if not current and signal != 0 and wick != 0.0:
-                        lot   = float(os.getenv('LOT_SIZE', '0.01'))
+                    # Get signal
+                    if not current:
+                        sig, wick, strat_name = self.meta.get_signal_and_wick(df)
+                    else:
+                        sig, wick, strat_name = 0, 0.0, ''
+
+                    # Execute
+                    if not current and sig != 0 and wick != 0.0:
                         price = await self._get_price()
 
-                        if signal == 1:
-                            entry = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
+                        if sig == 1:
+                            entry  = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
                             sl, tp = self._build_levels('BUY', entry, wick)
-                            print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | wick={wick:.2f}")
+                            print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | [{strat_name}]")
                             result = await self.connection.create_market_buy_order(
                                 self.symbol, lot, sl, tp,
-                                {'comment': 'SHIVA:IFVG_BUY'},
+                                {'comment': f'SHIVA:{strat_name}'},
                             )
                         else:
-                            entry = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
+                            entry  = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
                             sl, tp = self._build_levels('SELL', entry, wick)
-                            print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | wick={wick:.2f}")
+                            print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | [{strat_name}]")
                             result = await self.connection.create_market_sell_order(
                                 self.symbol, lot, sl, tp,
-                                {'comment': 'SHIVA:IFVG_SELL'},
+                                {'comment': f'SHIVA:{strat_name}'},
                             )
 
-                        # Track new position
                         new_positions = await self.connection.get_positions()
                         new_pos = next(
                             (p for p in new_positions
@@ -763,15 +898,18 @@ class ExecutionEngine:
                             None,
                         )
                         if new_pos:
-                            side = 'BUY' if signal == 1 else 'SELL'
-                            zone = "DISCOUNT" if signal == 1 else "PREMIUM"
-                            self.tracked[new_pos['id']] = self.ifvg_strategy.name
-                            self.analytics.log_open(
-                                new_pos['id'], side, entry, sl, tp, lot, self.ifvg_strategy.name
+                            side = 'BUY' if sig == 1 else 'SELL'
+                            zone = "DISCOUNT" if sig == 1 else "PREMIUM"
+                            self.tracked[new_pos['id']] = strat_name
+                            self.analytics.log_open(new_pos['id'], side, entry, sl, tp, lot, strat_name)
+                            self.daily_trades += 1
+                            discord_trade_open(
+                                side, self.symbol, entry, sl, tp, lot, zone, wick,
+                                strat_name, self.daily_trades, self.max_daily_trades
                             )
-                            discord_trade_open(side, self.symbol, entry, sl, tp, lot, zone, wick)
+                            print(f"  Daily trades: {self.daily_trades}/{self.max_daily_trades}")
 
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(30)  # check every 30s (5m candles)
 
                 except Exception as e:
                     msg = str(e)
@@ -812,7 +950,7 @@ if __name__ == "__main__":
     ACCOUNT_ID = require_env('METAAPI_ACCOUNT_ID')
     SYMBOL     = os.getenv('SYMBOL', 'USOIL')
 
-    print(f"🚀 Starting SHIVA V5  |  {SYMBOL}  |  IFVG + DISCOUNT/PREMIUM")
+    print(f"🚀 Starting SHIVA V6  |  {SYMBOL}  |  IFVG+FVG Scalp  |  Fixed SL/TP")
 
     _bootstrap_analytics = AnalyticsEngine()
     start_health_server(_bootstrap_analytics)
