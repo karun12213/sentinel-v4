@@ -446,13 +446,13 @@ if __name__ == '__main__':
     os.environ['SELL_ENABLED'] = '0'
     trades_1h = run(
         df_1h,
-        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [FVG+EMA_BOUNCE BUY-only | Daily EMA200 | SL=0.50pt]',
+        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [FVG_SCALP only BUY-only | Daily EMA200 | SL=0.50pt]',
         initial_capital=100.0,
         sl_pts=0.50,
         tp_pts=3.00,
         cooldown_bars=1,
         max_daily_trades=9,
-        strategy_list=[FVGScalpStrategy(), EMABounceStrategy()],
+        strategy_list=[FVGScalpStrategy()],
         daily_ema200=daily_ema200_series,
     )
 
@@ -463,13 +463,13 @@ if __name__ == '__main__':
     df_15m    = fetch('15m', period='60d')
     trades_15 = run(
         df_15m,
-        label='15M  |  last 60 days (max available)  [FVG_SCALP + EMA_BOUNCE + Daily EMA200]',
+        label='15M  |  last 60 days (max available)  [FVG_SCALP only + Daily EMA200]',
         initial_capital=100.0,
         sl_pts=0.30,
         tp_pts=1.80,
         cooldown_bars=1,
         max_daily_trades=9,
-        strategy_list=[FVGScalpStrategy(), EMABounceStrategy()],
+        strategy_list=[FVGScalpStrategy()],
         daily_ema200=daily_ema200_series,
     )
 

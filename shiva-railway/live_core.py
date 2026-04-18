@@ -685,11 +685,9 @@ class ExecutionEngine:
         self.symbol     = symbol
         self.is_running = True
 
-        # Strategies: FVG_SCALP (quality zones) + EMA_BOUNCE (frequency)
-        # IFVG_SMC excluded in fixed-SL mode (designed for dynamic ATR-based SL)
+        # FVG_SCALP only — EMA_BOUNCE removed (dragged WR from 31.8% → 18.9%)
         self.fvg_scalp     = FVGScalpStrategy()
-        self.ema_bounce    = EMABounceStrategy()
-        self.meta          = MetaController([self.fvg_scalp, self.ema_bounce])
+        self.meta          = MetaController([self.fvg_scalp])
         self.analytics     = AnalyticsEngine()
 
         self.connection  = None
