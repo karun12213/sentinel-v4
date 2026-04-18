@@ -31,7 +31,8 @@ except ImportError:
     print("pip install yfinance"); sys.exit(1)
 
 sys.path.insert(0, os.path.dirname(__file__))
-from live_core import FeatureEngine, FVGScalpStrategy, EMABounceStrategy, compute_lot_size
+from live_core import (FeatureEngine, FVGScalpStrategy, EMABounceStrategy,
+                        OrderBlockStrategy, LiquiditySweepFVGStrategy, compute_lot_size)
 
 
 # ─────────────────────────────────────────────
@@ -446,30 +447,46 @@ if __name__ == '__main__':
     os.environ['SELL_ENABLED'] = '0'
     trades_1h = run(
         df_1h,
-        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [FVG_SCALP only BUY-only | Daily EMA200 | SL=0.50pt]',
+        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [FVG+OB+LS BUY-only | Session+VWAP+Volume | SL=0.50pt]',
         initial_capital=100.0,
         sl_pts=0.50,
         tp_pts=3.00,
         cooldown_bars=1,
         max_daily_trades=9,
-        strategy_list=[FVGScalpStrategy()],
+        strategy_list=[FVGScalpStrategy(), OrderBlockStrategy(), LiquiditySweepFVGStrategy()],
         daily_ema200=daily_ema200_series,
     )
 
     # ── 15m last 60 days ──
+    # FVG_SCALP is primary — OB/LS as supplementary (only fire when FVG silent)
     os.environ['ADX_MIN']      = '20'
-    os.environ['SELL_ENABLED'] = '1'   # restore for 15m (daily EMA200 handles sell direction)
+    os.environ['SELL_ENABLED'] = '1'
     print("📊 Running 15m backtest (last 60 days — max yfinance supports for 15m)…\n")
     df_15m    = fetch('15m', period='60d')
+
+    # 15m A: FVG-only (headline result — cleanest signal)
     trades_15 = run(
-        df_15m,
-        label='15M  |  last 60 days (max available)  [FVG_SCALP only + Daily EMA200]',
+        df_15m.copy(),
+        label='15M-A  |  last 60 days  [FVG_SCALP only | Volume+Session | Daily EMA200]',
         initial_capital=100.0,
         sl_pts=0.30,
         tp_pts=1.80,
         cooldown_bars=1,
         max_daily_trades=9,
         strategy_list=[FVGScalpStrategy()],
+        daily_ema200=daily_ema200_series,
+    )
+
+    # 15m B: All 3 strategies (supplementary — OB/LS fire when FVG is silent)
+    trades_15b = run(
+        df_15m.copy(),
+        label='15M-B  |  last 60 days  [FVG+OB+LS | Volume+Session | Daily EMA200]',
+        initial_capital=100.0,
+        sl_pts=0.30,
+        tp_pts=1.80,
+        cooldown_bars=1,
+        max_daily_trades=9,
+        strategy_list=[FVGScalpStrategy(), OrderBlockStrategy(), LiquiditySweepFVGStrategy()],
         daily_ema200=daily_ema200_series,
     )
 

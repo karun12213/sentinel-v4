@@ -73,7 +73,7 @@ def discord_trade_open(side: str, symbol: str, entry: float,
             {"name": "Zone",     "value": f"`{zone}`",            "inline": True},
             {"name": "Strategy", "value": f"`{strategy_name}`",   "inline": True},
         ],
-        "footer": {"text": "SHIVA V6 — IFVG+FVG Scalp"},
+        "footer": {"text": "SHIVA V11 — FVG+OB+LS Scalp"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }]})
 
@@ -90,7 +90,7 @@ def discord_trade_close(side: str, symbol: str, entry: float,
             {"name": "Exit",   "value": f"`{exit_price:.2f}`", "inline": True},
             {"name": "PnL",    "value": f"`${pnl:.2f}`",       "inline": True},
         ],
-        "footer": {"text": "SHIVA V6 — IFVG+FVG Scalp"},
+        "footer": {"text": "SHIVA V11 — FVG+OB+LS Scalp"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }]})
 
@@ -111,7 +111,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain; charset=utf-8')
             self.end_headers()
-            self.wfile.write(b'OK - SHIVA V6 LIVE')
+            self.wfile.write(b'OK - SHIVA V11 LIVE')
 
     def log_message(self, *_):
         return
@@ -188,6 +188,29 @@ class FeatureEngine:
                 if mid:   df['BB_mid']   = bb[mid].values
         except Exception:
             pass
+
+        # VWAP — resets daily; used as intraday institutional reference
+        try:
+            if 'volume' in df.columns and df['volume'].sum() > 0:
+                idx = df.index
+                if not isinstance(idx, pd.DatetimeIndex):
+                    if 'time' in df.columns:
+                        idx = pd.to_datetime(df['time'], utc=True)
+                    else:
+                        raise ValueError("no datetime")
+                if getattr(idx, 'tz', None) is None:
+                    idx = idx.tz_localize('UTC')
+                date_grp = idx.normalize()
+                tp    = (df['high'] + df['low'] + df['close']) / 3.0
+                tp_v  = tp * df['volume'].replace(0, np.nan).fillna(1)
+                vol_c = df['volume'].replace(0, np.nan).fillna(1)
+                df['VWAP'] = tp_v.groupby(date_grp).cumsum() / vol_c.groupby(date_grp).cumsum()
+        except Exception:
+            pass
+
+        # Volume SMA(20) — used for volume-confirmation filter
+        if 'volume' in df.columns:
+            df['VOL_SMA20'] = df['volume'].rolling(20).mean()
 
         core = ['RSI', 'ATR', 'EMA_20', 'EMA_50']
         return df.dropna(subset=core)
@@ -447,6 +470,17 @@ class FVGScalpStrategy(BaseStrategy):
         if atr > sl_pts * 1.5:           return 0, 0.0  # too volatile
         if adx > 0 and adx < adx_min:   return 0, 0.0  # no trend
 
+        # Session filter: skip weekend open gap / Sunday gaps only
+        try:
+            bar_dt  = df.index[-1]
+            bar_hour = bar_dt.hour if hasattr(bar_dt, 'hour') else None
+            if bar_hour is not None and not (1 <= bar_hour < 23):
+                return 0, 0.0
+        except Exception:
+            pass
+
+        vwap = float(r.get('VWAP', 0) or 0)   # available for display in logs
+
         bars = df.tail(self.LOOKBACK + 3)
         n    = len(bars.reset_index(drop=True))
         fvgs = self._find_fvgs(bars)
@@ -457,7 +491,7 @@ class FVGScalpStrategy(BaseStrategy):
         ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
         bar_mid     = (high + low) / 2.0
 
-        # BUY: FVG retest in uptrend, EMA20+EMA50 rising, RSI 35–68
+        # BUY: FVG retest in uptrend, EMA20+EMA50 rising, RSI 35–65
         if uptrend and 35 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bull':        continue
@@ -563,6 +597,254 @@ class EMABounceStrategy(BaseStrategy):
             wick = high
             print(f"  🟧 EMA BOUNCE SELL close={close:.3f} < EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
             return -1, wick
+
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
+# ORDER BLOCK STRATEGY  (SMC — last opposing candle before impulse)
+# ─────────────────────────────────────────────
+class OrderBlockStrategy(BaseStrategy):
+    """
+    Bullish OB: last bearish candle before a strong bullish impulse ≥ 0.8×ATR.
+    Bearish OB: last bullish candle before a strong bearish impulse ≥ 0.8×ATR.
+    Enter on retest into OB zone with confirming close + trend alignment.
+    Complements FVG_SCALP — activates on higher-quality institutional zones.
+    """
+    LOOKBACK         = 30
+    MAX_AGE          = 12   # fresher OBs are more reliable
+    MIN_IMPULSE_ATR  = 1.3  # require a strong impulse to validate the OB
+
+    def __init__(self):
+        super().__init__("OB_SMC")
+
+    def _find_obs(self, bars: pd.DataFrame, atr: float) -> list[dict]:
+        bars = bars.reset_index(drop=True)
+        n    = len(bars)
+        obs  = []
+        for i in range(2, n - 4):
+            bar = bars.iloc[i]
+            # Bullish OB: bearish candle → subsequent bullish impulse
+            if float(bar['close']) < float(bar['open']):
+                future = bars.iloc[i + 1: min(i + 5, n)]
+                if not future.empty:
+                    impulse = float(future['high'].max()) - float(bar['high'])
+                    if impulse >= atr * self.MIN_IMPULSE_ATR:
+                        obs.append({'type': 'bull', 'low': float(bar['low']),
+                                    'high': float(bar['high']), 'idx': i})
+            # Bearish OB: bullish candle → subsequent bearish impulse
+            elif float(bar['close']) > float(bar['open']):
+                future = bars.iloc[i + 1: min(i + 5, n)]
+                if not future.empty:
+                    impulse = float(bar['low']) - float(future['low'].min())
+                    if impulse >= atr * self.MIN_IMPULSE_ATR:
+                        obs.append({'type': 'bear', 'low': float(bar['low']),
+                                    'high': float(bar['high']), 'idx': i})
+        return obs
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < 65:
+            return 0, 0.0
+
+        r      = df.iloc[-1]
+        close  = float(r['close'])
+        open_  = float(r['open'])
+        high   = float(r['high'])
+        low    = float(r['low'])
+        ema200 = float(r.get('EMA_200', close) or close)
+        ema20  = float(r.get('EMA_20',  close) or close)
+        ema50  = float(r.get('EMA_50',  close) or close)
+        rsi    = float(r.get('RSI', 50)   or 50)
+        atr    = float(r.get('ATR', 0)    or 0)
+        adx    = float(r.get('ADX_14', 0) or 0)
+
+        if atr == 0: return 0, 0.0
+
+        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
+        adx_min = float(os.getenv('ADX_MIN',   '20'))
+        if atr > sl_pts * 1.5:         return 0, 0.0
+        if adx > 0 and adx < adx_min: return 0, 0.0
+
+        # Session filter: OBs are most reliable during London+NY active hours
+        try:
+            bh = df.index[-1].hour if hasattr(df.index[-1], 'hour') else None
+            if bh is not None and not (7 <= bh < 20):
+                return 0, 0.0
+        except Exception:
+            pass
+
+        # Volume confirmation — OBs require meaningful participation
+        try:
+            vol_sma = float(r.get('VOL_SMA20', 0) or 0)
+            cur_vol = float(r.get('volume',    0) or 0)
+            if vol_sma > 0 and cur_vol < vol_sma * 0.75:
+                return 0, 0.0
+        except Exception:
+            pass
+
+        uptrend   = close > ema200
+        downtrend = close < ema200
+        r_prev    = df.iloc[-2]
+        ema20_slope = ema20 - float(r_prev.get('EMA_20', ema20) or ema20)
+        ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
+        bar_mid     = (high + low) / 2.0
+
+        bars = df.tail(self.LOOKBACK + 5)
+        n    = len(bars)
+        obs  = self._find_obs(bars, atr)
+
+        # BUY: bullish OB retest — price touches OB, closes bullishly above midpoint
+        if uptrend and 35 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0:
+            for ob in reversed(obs):
+                if ob['type'] != 'bull': continue
+                age = n - 1 - ob['idx']
+                if age > self.MAX_AGE or age < 3: continue
+                if low  > ob['high']:  continue   # didn't reach OB
+                if close < ob['low']:  continue   # pierced through — zone failed
+                if close < open_:      continue   # bearish close inside OB = bad
+                if close < bar_mid:    continue   # close in lower half = weak
+                print(f"  🟦 OB BUY   [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
+                return 1, ob['low']
+
+        if os.getenv('SELL_ENABLED', '1') == '0':
+            return 0, 0.0
+
+        # SELL: bearish OB retest
+        if downtrend and 50 < rsi < 75 and ema20_slope < 0 and ema50_slope <= 0:
+            for ob in reversed(obs):
+                if ob['type'] != 'bear': continue
+                age = n - 1 - ob['idx']
+                if age > self.MAX_AGE or age < 3: continue
+                if high < ob['low']:   continue
+                if close > ob['high']: continue
+                if close > open_:      continue
+                if close > bar_mid:    continue
+                print(f"  🟧 OB SELL  [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
+                return -1, ob['high']
+
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
+# LIQUIDITY SWEEP + FVG STRATEGY  (highest-conviction SMC setup)
+# ─────────────────────────────────────────────
+class LiquiditySweepFVGStrategy(BaseStrategy):
+    """
+    Detects: liquidity sweep of a prior swing high/low (stop-hunt) immediately
+    followed by a fresh FVG in the opposite direction.
+    This is the gold-standard SMC entry: smart money takes liquidity THEN fills FVG.
+    Age of sweep: ≤ 3 bars before FVG formation.
+    """
+    LOOKBACK    = 40
+    SWING_BARS  = 12   # how far back to look for the swept swing level
+    MAX_AGE_FVG = 5
+
+    def __init__(self):
+        super().__init__("LS_FVG")
+
+    def _find_fvgs(self, bars: pd.DataFrame) -> list[dict]:
+        bars = bars.reset_index(drop=True)
+        n    = len(bars)
+        fvgs = []
+        for i in range(1, n - 1):
+            ph = float(bars.iloc[i - 1]['high'])
+            pl = float(bars.iloc[i - 1]['low'])
+            nh = float(bars.iloc[i + 1]['high'])
+            nl = float(bars.iloc[i + 1]['low'])
+            if ph < nl:
+                fvgs.append({'type': 'bull', 'low': ph, 'high': nl, 'idx': i})
+            if pl > nh:
+                fvgs.append({'type': 'bear', 'low': nh, 'high': pl, 'idx': i})
+        return fvgs
+
+    def _swept_liquidity(self, bars: pd.DataFrame, fvg_idx: int) -> bool:
+        """True if within 3 bars before fvg_idx there was a wick above swing_high (bull sweep → bearish FVG)."""
+        bars = bars.reset_index(drop=True)
+        n    = len(bars)
+        sweep_window = bars.iloc[max(0, fvg_idx - 3): fvg_idx]
+        if sweep_window.empty:
+            return False
+        lookback_start = max(0, fvg_idx - self.SWING_BARS - 3)
+        prior = bars.iloc[lookback_start: fvg_idx - 3]
+        if prior.empty:
+            return False
+        swing_high = float(prior['high'].max())
+        swing_low  = float(prior['low'].min())
+        # Liquidity sweep above → bearish reversal (for SELL setup)
+        swept_high = any(float(b['high']) > swing_high for _, b in sweep_window.iterrows())
+        # Liquidity sweep below → bullish reversal (for BUY setup)
+        swept_low  = any(float(b['low'])  < swing_low  for _, b in sweep_window.iterrows())
+        return swept_high or swept_low
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < 70:
+            return 0, 0.0
+
+        r      = df.iloc[-1]
+        close  = float(r['close'])
+        open_  = float(r['open'])
+        high   = float(r['high'])
+        low    = float(r['low'])
+        ema200 = float(r.get('EMA_200', close) or close)
+        ema20  = float(r.get('EMA_20',  close) or close)
+        ema50  = float(r.get('EMA_50',  close) or close)
+        rsi    = float(r.get('RSI', 50)   or 50)
+        atr    = float(r.get('ATR', 0)    or 0)
+        adx    = float(r.get('ADX_14', 0) or 0)
+
+        if atr == 0: return 0, 0.0
+        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
+        adx_min = float(os.getenv('ADX_MIN', '20'))
+        if atr > sl_pts * 1.8:         return 0, 0.0  # slightly wider — LS setups happen in volatile bars
+        if adx > 0 and adx < adx_min: return 0, 0.0
+
+        # Session filter
+        try:
+            bh = df.index[-1].hour if hasattr(df.index[-1], 'hour') else None
+            if bh is not None and not (7 <= bh < 17):
+                return 0, 0.0
+        except Exception:
+            pass
+
+        uptrend   = close > ema200
+        downtrend = close < ema200
+        r_prev    = df.iloc[-2]
+        ema20_slope = ema20 - float(r_prev.get('EMA_20', ema20) or ema20)
+        ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
+        bar_mid     = (high + low) / 2.0
+
+        bars = df.tail(self.LOOKBACK + 5)
+        n    = len(bars)
+        fvgs = self._find_fvgs(bars)
+
+        # BUY: sweep below swing low → bullish FVG retested
+        if uptrend and 30 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bull': continue
+                age = n - 1 - fvg['idx']
+                if age > self.MAX_AGE_FVG or age < 1: continue
+                if low  > fvg['high']:  continue
+                if close < fvg['low']:  continue
+                if close < open_:       continue
+                if self._swept_liquidity(bars, fvg['idx']):
+                    print(f"  🟢 LS+FVG BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
+                    return 1, fvg['low']
+
+        if os.getenv('SELL_ENABLED', '1') == '0':
+            return 0, 0.0
+
+        # SELL: sweep above swing high → bearish FVG retested
+        if downtrend and 45 < rsi < 75 and ema20_slope < 0 and ema50_slope <= 0 and close <= bar_mid:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bear': continue
+                age = n - 1 - fvg['idx']
+                if age > self.MAX_AGE_FVG or age < 1: continue
+                if high < fvg['low']:   continue
+                if close > fvg['high']: continue
+                if close > open_:       continue
+                if self._swept_liquidity(bars, fvg['idx']):
+                    print(f"  🔴 LS+FVG SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
+                    return -1, fvg['high']
 
         return 0, 0.0
 
@@ -685,9 +967,11 @@ class ExecutionEngine:
         self.symbol     = symbol
         self.is_running = True
 
-        # FVG_SCALP only — EMA_BOUNCE removed (dragged WR from 31.8% → 18.9%)
-        self.fvg_scalp     = FVGScalpStrategy()
-        self.meta          = MetaController([self.fvg_scalp])
+        # V11: FVG_SCALP + OB_SMC + LS_FVG — three complementary SMC strategies
+        self.fvg_scalp   = FVGScalpStrategy()
+        self.ob_smc      = OrderBlockStrategy()
+        self.ls_fvg      = LiquiditySweepFVGStrategy()
+        self.meta        = MetaController([self.fvg_scalp, self.ob_smc, self.ls_fvg])
         self.analytics     = AnalyticsEngine()
 
         self.connection  = None
@@ -899,7 +1183,7 @@ class ExecutionEngine:
     # ── main loop ──
 
     async def run(self):
-        print(f"🔱 SHIVA V6 LIVE | {self.symbol} | IFVG + FVG Scalp | Max {self.max_daily_trades}/day")
+        print(f"🔱 SHIVA V11 LIVE | {self.symbol} | FVG+OB+LS | Session+VWAP+Volume | Max {self.max_daily_trades}/day")
         self.api = MetaApi(self.token)
         try:
             self.account = await self.api.metatrader_account_api.get_account(self.account_id)
@@ -914,10 +1198,12 @@ class ExecutionEngine:
             print(
                 f"✅ MetaApi synchronized | {self.symbol}\n"
                 f"── Strategy ──────────────────────────────────────────\n"
-                f"  [1] FVG_SCALP  — fresh FVG first-touch scalp (V10: EMA_BOUNCE removed)\n"
+                f"  [1] FVG_SCALP — fresh FVG first-touch (session+VWAP+volume filters)\n"
+                f"  [2] OB_SMC    — order block retest (SMC institutional zones)\n"
+                f"  [3] LS_FVG    — liquidity sweep + FVG combo (gold-standard SMC)\n"
                 f"  Fixed SL: {sl_pts} pts | TP: {sl_pts * tp_mult:.2f} pts ({tp_mult:.0f}R)\n"
                 f"  Dynamic lot: $100=$0.01  $300=$0.03  $600=$0.06  $900=$0.09\n"
-                f"  Daily limit: {self.max_daily_trades} trades | Cooldown: {self.COOLDOWN_SECS // 60} min\n"
+                f"  Daily limit: {self.max_daily_trades} trades | Session: 07:00–17:00 UTC\n"
                 f"─────────────────────────────────────────────────────\n"
             )
 
@@ -1062,7 +1348,7 @@ if __name__ == "__main__":
     ACCOUNT_ID = require_env('METAAPI_ACCOUNT_ID')
     SYMBOL     = os.getenv('SYMBOL', 'USOIL')
 
-    print(f"🚀 Starting SHIVA V6  |  {SYMBOL}  |  IFVG+FVG Scalp  |  Fixed SL/TP")
+    print(f"🚀 Starting SHIVA V11  |  {SYMBOL}  |  FVG+OB+LS Scalp  |  Session+VWAP+Volume filters")
 
     _bootstrap_analytics = AnalyticsEngine()
     start_health_server(_bootstrap_analytics)
