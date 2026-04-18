@@ -457,13 +457,14 @@ if __name__ == '__main__':
     df_15m    = fetch('15m', period='60d')
     trades_15 = run(
         df_15m,
-        label='15M  |  last 60 days (max available)  [FVG_SCALP + EMA_BOUNCE]',
+        label='15M  |  last 60 days (max available)  [FVG_SCALP + EMA_BOUNCE + Daily EMA200]',
         initial_capital=100.0,
         sl_pts=0.30,
         tp_pts=1.80,
         cooldown_bars=1,
         max_daily_trades=9,
         strategy_list=[FVGScalpStrategy(), EMABounceStrategy()],
+        daily_ema200=daily_ema200_series,
     )
 
     # ── Save & print all trades ──

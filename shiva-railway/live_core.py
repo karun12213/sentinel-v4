@@ -168,6 +168,14 @@ class FeatureEngine:
         df['EMA_20'] = ta.ema(df['close'], length=20)
         df['EMA_50'] = ta.ema(df['close'], length=50)
         df['EMA_200']= ta.ema(df['close'], length=200)
+        try:
+            adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+            if adx_df is not None and not adx_df.empty:
+                adx_col = next((c for c in adx_df.columns if c.startswith('ADX_')), None)
+                if adx_col:
+                    df['ADX_14'] = adx_df[adx_col].values
+        except Exception:
+            pass
 
         try:
             bb = ta.bbands(df['close'], length=20, std=2)
@@ -428,14 +436,17 @@ class FVGScalpStrategy(BaseStrategy):
         rsi    = float(r.get('RSI', 50) or 50)
 
         ema20  = float(r.get('EMA_20', close) or close)
+        ema50  = float(r.get('EMA_50', close) or close)
         atr    = float(r.get('ATR', 0) or 0)
+        adx    = float(r.get('ADX_14', 0) or 0)
         uptrend   = close > ema200
         downtrend = close < ema200
 
-        # Skip when volatility is too high for fixed SL (ATR > 2× SL points)
         sl_pts = float(os.getenv('SL_POINTS', '0.30'))
-        if atr > sl_pts * 2.0:
-            return 0, 0.0
+        # Skip: too volatile (tightened 2.0→1.5 to catch crash days)
+        if atr > sl_pts * 1.5:  return 0, 0.0
+        # Skip: no trend (ADX < 20 = ranging market, skip)
+        if adx > 0 and adx < 20: return 0, 0.0
 
         bars = df.tail(self.LOOKBACK + 3)
         n    = len(bars.reset_index(drop=True))
@@ -444,24 +455,25 @@ class FVGScalpStrategy(BaseStrategy):
         r_prev     = df.iloc[-2]
         prev_close = float(r_prev['close'])
         prev_ema20 = float(r_prev.get('EMA_20', close) or close)
-        ema20_slope = ema20 - prev_ema20   # positive = EMA20 rising, negative = falling
+        ema20_slope = ema20 - prev_ema20
+        ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
         bar_mid    = (high + low) / 2.0
 
-        # BUY: bullish FVG retest in uptrend, EMA20 rising, strong close above bar mid
-        if uptrend and rsi < 65 and ema20_slope > 0 and close >= bar_mid:
+        # BUY: FVG retest, uptrend, EMA20+EMA50 both rising, RSI 35–65 (momentum present, not extended)
+        if uptrend and 35 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bull':        continue
                 age = n - 1 - fvg['idx']
                 if age > self.MAX_AGE:           continue
                 if age < 1:                      continue
-                if low  > fvg['high']:           continue  # didn't enter zone
-                if close < fvg['low']:           continue  # broke through zone — skip
-                if close < open_:               continue  # need bullish close
-                print(f"  🟢 FVG SCALP BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
+                if low  > fvg['high']:           continue
+                if close < fvg['low']:           continue
+                if close < open_:               continue
+                print(f"  🟢 FVG SCALP BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
                 return 1, fvg['low']
 
-        # SELL: bearish FVG retest in downtrend, EMA20 falling, RSI > 50 (not yet oversold)
-        if downtrend and 50 < rsi < 80 and ema20_slope < 0 and close <= bar_mid:
+        # SELL: bearish FVG retest, downtrend, EMA20+EMA50 both falling, RSI 50–75
+        if downtrend and 50 < rsi < 75 and ema20_slope < 0 and ema50_slope <= 0 and close <= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bear':        continue
                 age = n - 1 - fvg['idx']
@@ -470,7 +482,7 @@ class FVGScalpStrategy(BaseStrategy):
                 if high < fvg['low']:            continue  # didn't reach zone
                 if close > fvg['high']:          continue  # broke through zone — skip
                 if close > open_:               continue  # need bearish close
-                print(f"  🔴 FVG SCALP SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
+                print(f"  🔴 FVG SCALP SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
                 return -1, fvg['high']
 
         return 0, 0.0
@@ -502,48 +514,51 @@ class EMABounceStrategy(BaseStrategy):
         high   = float(r['high'])
         low    = float(r['low'])
         ema20  = float(r.get('EMA_20', close) or close)
+        ema50  = float(r.get('EMA_50', close) or close)
         ema200 = float(r.get('EMA_200', close) or close)
         atr    = float(r.get('ATR', 0) or 0)
+        adx    = float(r.get('ADX_14', 0) or 0)
         rsi    = float(r.get('RSI', 50) or 50)
 
         prev_close = float(prev['close'])
         prev_ema20 = float(prev.get('EMA_20', prev_close) or prev_close)
 
-        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
-        tp_pts  = sl_pts * float(os.getenv('TP_MULT', '6.0'))
-        # Skip if ATR is too high (whipsaw) or too low (market not moving enough for TP)
-        min_atr = float(os.getenv('MIN_ATR', '0.0'))
-        if atr > sl_pts * 2.0:          return 0, 0.0   # too volatile for tight SL
-        if min_atr > 0 and atr < min_atr: return 0, 0.0  # too quiet for TP to be reachable
+        sl_pts = float(os.getenv('SL_POINTS', '0.30'))
+        # Skip: too volatile (tightened to 1.5× to catch crash/gap days)
+        if atr > sl_pts * 1.5:   return 0, 0.0
+        # Skip: no trend (ADX < 20 = ranging market)
+        if adx > 0 and adx < 20: return 0, 0.0
 
-        bar_mid = (high + low) / 2.0
+        bar_mid   = (high + low) / 2.0
         uptrend   = close > ema200
         downtrend = close < ema200
+        ema20_slope = ema20 - prev_ema20
+        ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
 
-        ema20_slope = ema20 - prev_ema20   # EMA20 direction filter
-
-        # BUY: bounced off EMA20 in uptrend, EMA20 slope rising
+        # BUY: EMA20 bounce in uptrend, both EMA20+EMA50 rising, RSI 35–65
         if (uptrend and
-                ema20_slope > 0 and           # EMA20 rising (confirmed uptrend)
-                prev_close < prev_ema20 and   # previous bar below EMA20
-                close > ema20 and             # current bar crossed back above
-                close > open_ and             # bullish body
-                close >= bar_mid and          # strong close
-                rsi < 65):
+                35 < rsi < 65 and
+                ema20_slope > 0 and
+                ema50_slope >= 0 and
+                prev_close < prev_ema20 and
+                close > ema20 and
+                close > open_ and
+                close >= bar_mid):
             wick = low
-            print(f"  🟦 EMA BOUNCE BUY  close={close:.3f} > EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}")
+            print(f"  🟦 EMA BOUNCE BUY  close={close:.3f} > EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
             return 1, wick
 
-        # SELL: rejected at EMA20 in downtrend, RSI > 50 (not already oversold = crash mode)
+        # SELL: EMA20 rejection in downtrend, both EMA20+EMA50 falling, RSI 50–75
         if (downtrend and
-                ema20_slope < 0 and           # EMA20 falling (confirmed downtrend)
-                prev_close > prev_ema20 and   # previous bar above EMA20
-                close < ema20 and             # current bar crossed back below
-                close < open_ and             # bearish body
-                close <= bar_mid and          # strong close
-                50 < rsi < 80):              # RSI above 50 = momentum still elevated
+                50 < rsi < 75 and
+                ema20_slope < 0 and
+                ema50_slope <= 0 and
+                prev_close > prev_ema20 and
+                close < ema20 and
+                close < open_ and
+                close <= bar_mid):
             wick = high
-            print(f"  🟧 EMA BOUNCE SELL close={close:.3f} < EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}")
+            print(f"  🟧 EMA BOUNCE SELL close={close:.3f} < EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
             return -1, wick
 
         return 0, 0.0
@@ -681,6 +696,10 @@ class ExecutionEngine:
 
         self.tracked: dict[str, str] = {}
         self.last_close_time: float  = 0.0
+
+        # Daily EMA200 macro filter
+        self._daily_ema200      = None
+        self._daily_ema200_date = None
 
         # Daily trade counter + circuit breaker
         self.max_daily_trades   = int(os.getenv('MAX_DAILY_TRADES', '9'))
@@ -859,6 +878,23 @@ class ExecutionEngine:
         df = pd.DataFrame(candles)
         return FeatureEngine.add_indicators(df)
 
+    async def _update_daily_ema200(self):
+        """Fetch daily candles, compute EMA200, cache for macro trend filter."""
+        today = datetime.now(timezone.utc).date()
+        if self._daily_ema200_date == today and self._daily_ema200 is not None:
+            return  # already fresh for today
+        try:
+            start = datetime.now(timezone.utc) - timedelta(days=300)
+            candles = await self.account.get_historical_candles(self.symbol, '1day', start, 220)
+            if candles and len(candles) >= 200:
+                closes = pd.Series([c['close'] for c in candles])
+                ema = ta.ema(closes, length=200)
+                self._daily_ema200 = float(ema.iloc[-1])
+                self._daily_ema200_date = today
+                print(f"📅 Daily EMA200 updated: {self._daily_ema200:.3f}")
+        except Exception as e:
+            print(f"⚠️  Daily EMA200 update failed: {e}")
+
     # ── main loop ──
 
     async def run(self):
@@ -885,9 +921,13 @@ class ExecutionEngine:
                 f"─────────────────────────────────────────────────────\n"
             )
 
+            # Initial daily EMA200 fetch
+            await self._update_daily_ema200()
+
             while self.is_running:
                 try:
                     self._check_daily_reset()
+                    await self._update_daily_ema200()   # refreshes once/day
 
                     df = await self._fetch_candles()
                     if df.empty:
@@ -923,6 +963,15 @@ class ExecutionEngine:
                     # Get signal
                     if not current:
                         sig, wick, strat_name = self.meta.get_signal_and_wick(df)
+                        # Daily EMA200 macro filter — align trades with macro trend
+                        if sig != 0 and self._daily_ema200 is not None:
+                            cur_close = float(df.iloc[-1]['close'])
+                            if sig == 1 and cur_close < self._daily_ema200:
+                                print(f"🚫 BUY blocked: close {cur_close:.2f} < daily EMA200 {self._daily_ema200:.2f}")
+                                sig = 0
+                            elif sig == -1 and cur_close > self._daily_ema200:
+                                print(f"🚫 SELL blocked: close {cur_close:.2f} > daily EMA200 {self._daily_ema200:.2f}")
+                                sig = 0
                     else:
                         sig, wick, strat_name = 0, 0.0, ''
 
