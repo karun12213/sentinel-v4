@@ -1,7 +1,12 @@
 """
-SHIVA V6 — IFVG + FVG Scalp | Fixed SL/TP | Max 9 trades/day
-Entry: IFVG zone retests (quality) + Fresh FVG scalp (frequency)
-SL: Fixed $3 / TP: Fixed $18 (6:1 RR) at 0.01 lot
+SHIVA V6 — IFVG + FVG Scalp | Fixed SL/TP | Dynamic Lot | Max 9 trades/day
+Entry: Fresh FVG zone retests + EMA20 bounce
+SL: Fixed 0.30pt ($3 at 0.01 lot)  TP: Fixed 1.80pt ($18 at 0.01 lot)  RR: 1:6
+Lot scaling every $300 of balance:
+  $100-$299 → 0.01 lot  ($3 SL / $18 TP)
+  $300-$599 → 0.03 lot  ($9 SL / $54 TP)
+  $600-$899 → 0.06 lot  ($18 SL / $108 TP)
+  $900+     → 0.09+     (scales linearly)
 Daily limit: MAX_DAILY_TRADES (default 9)
 """
 import asyncio
@@ -125,6 +130,26 @@ def require_env(name):
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
     return value
+
+
+# ─────────────────────────────────────────────
+# DYNAMIC LOT SIZING
+# ─────────────────────────────────────────────
+def compute_lot_size(capital: float,
+                     base_capital: float = 100.0,
+                     step: float = 300.0,
+                     base_lot: float = 0.01) -> float:
+    """
+    Scales lot size proportionally every $300 of capital:
+      $100–$299 → 0.01   $300–$599 → 0.03
+      $600–$899 → 0.06   $900–$1199 → 0.09  etc.
+    Formula: lot = max(base_lot, floor(capital / step) * (step / base_capital * base_lot))
+    """
+    if capital < step:
+        return base_lot
+    tier = int(capital // step)
+    lot  = round(tier * (step / base_capital) * base_lot, 2)
+    return max(base_lot, lot)
 
 
 # ─────────────────────────────────────────────
@@ -485,10 +510,12 @@ class EMABounceStrategy(BaseStrategy):
         prev_close = float(prev['close'])
         prev_ema20 = float(prev.get('EMA_20', prev_close) or prev_close)
 
-        # Skip high-volatility bars
-        sl_pts = float(os.getenv('SL_POINTS', '0.30'))
-        if atr > sl_pts * 2.0:
-            return 0, 0.0
+        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
+        tp_pts  = sl_pts * float(os.getenv('TP_MULT', '6.0'))
+        # Skip if ATR is too high (whipsaw) or too low (market not moving enough for TP)
+        min_atr = float(os.getenv('MIN_ATR', '0.0'))
+        if atr > sl_pts * 2.0:          return 0, 0.0   # too volatile for tight SL
+        if min_atr > 0 and atr < min_atr: return 0, 0.0  # too quiet for TP to be reachable
 
         bar_mid = (high + low) / 2.0
         uptrend   = close > ema200
@@ -688,6 +715,15 @@ class ExecutionEngine:
             print(f"⚠️  Price fetch: {e}")
             return {}
 
+    async def _get_balance(self) -> float:
+        """Fetch current account balance for dynamic lot sizing."""
+        try:
+            info = await self.connection.get_account_information()
+            return float(info.get('balance', 100.0))
+        except Exception as e:
+            print(f"⚠️  Balance fetch: {e}")
+            return 100.0
+
     def _point(self) -> float:
         if self.symbol_spec:
             ts = self.symbol_spec.get('tickSize')
@@ -826,14 +862,13 @@ class ExecutionEngine:
             print(
                 f"✅ MetaApi synchronized | {self.symbol}\n"
                 f"── Strategy ──────────────────────────────────────────\n"
-                f"  [1] IFVG_SMC   — high conviction zone retests\n"
-                f"  [2] FVG_SCALP  — fresh FVG first-touch scalp\n"
+                f"  [1] FVG_SCALP  — fresh FVG first-touch scalp\n"
+                f"  [2] EMA_BOUNCE — EMA20 dynamic S/R bounce\n"
                 f"  Fixed SL: {sl_pts} pts | TP: {sl_pts * tp_mult:.2f} pts ({tp_mult:.0f}R)\n"
+                f"  Dynamic lot: $100=$0.01  $300=$0.03  $600=$0.06  $900=$0.09\n"
                 f"  Daily limit: {self.max_daily_trades} trades | Cooldown: {self.COOLDOWN_SECS // 60} min\n"
                 f"─────────────────────────────────────────────────────\n"
             )
-
-            lot = float(os.getenv('LOT_SIZE', '0.01'))
 
             while self.is_running:
                 try:
@@ -872,12 +907,17 @@ class ExecutionEngine:
 
                     # Execute
                     if not current and sig != 0 and wick != 0.0:
-                        price = await self._get_price()
+                        # Dynamic lot based on live balance
+                        balance = await self._get_balance()
+                        lot     = compute_lot_size(balance)
+                        price   = await self._get_price()
 
                         if sig == 1:
                             entry  = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
                             sl, tp = self._build_levels('BUY', entry, wick)
-                            print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | [{strat_name}]")
+                            sl_usd = abs(entry - sl) * lot * 1000
+                            tp_usd = abs(tp - entry) * lot * 1000
+                            print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot} | bal=${balance:.0f} | [{strat_name}]")
                             result = await self.connection.create_market_buy_order(
                                 self.symbol, lot, sl, tp,
                                 {'comment': f'SHIVA:{strat_name}'},
@@ -885,7 +925,9 @@ class ExecutionEngine:
                         else:
                             entry  = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
                             sl, tp = self._build_levels('SELL', entry, wick)
-                            print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | [{strat_name}]")
+                            sl_usd = abs(sl - entry) * lot * 1000
+                            tp_usd = abs(entry - tp) * lot * 1000
+                            print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot} | bal=${balance:.0f} | [{strat_name}]")
                             result = await self.connection.create_market_sell_order(
                                 self.symbol, lot, sl, tp,
                                 {'comment': f'SHIVA:{strat_name}'},
@@ -907,7 +949,7 @@ class ExecutionEngine:
                                 side, self.symbol, entry, sl, tp, lot, zone, wick,
                                 strat_name, self.daily_trades, self.max_daily_trades
                             )
-                            print(f"  Daily trades: {self.daily_trades}/{self.max_daily_trades}")
+                            print(f"  Daily trades: {self.daily_trades}/{self.max_daily_trades}  |  Lot tier: {lot} (bal=${balance:.0f})")
 
                     await asyncio.sleep(30)  # check every 30s (5m candles)
 
