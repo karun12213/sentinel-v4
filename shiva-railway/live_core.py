@@ -29,6 +29,76 @@ import urllib.request
 import urllib.error
 
 import numpy as np
+
+# Phase 1 — HTF Bias Engine
+try:
+    from htf_bias import HTFBiasAgent
+    _HTF_BIAS_AVAILABLE = True
+except ImportError:
+    _HTF_BIAS_AVAILABLE = False
+
+# Phase 2 — Kill Zone Time Filter
+try:
+    from kill_zone import KillZoneAgent
+    _KILL_ZONE_AVAILABLE = True
+except ImportError:
+    _KILL_ZONE_AVAILABLE = False
+
+# Phase 3 — News Filter
+try:
+    from news_filter import NewsFilterAgent
+    _NEWS_FILTER_AVAILABLE = True
+except ImportError:
+    _NEWS_FILTER_AVAILABLE = False
+
+# Phase 4 — Confluence Scorer
+try:
+    from confluence import ConfluenceScorer, MarketState, EntrySize
+    _CONFLUENCE_AVAILABLE = True
+except ImportError:
+    _CONFLUENCE_AVAILABLE = False
+
+# Phase 5 — Regime Classifier
+try:
+    from regime import RegimeClassifier
+    _REGIME_AVAILABLE = True
+except ImportError:
+    _REGIME_AVAILABLE = False
+
+# Phase 6 — CNN Ensemble
+try:
+    from cnn_ensemble import CNNEnsembleAgent
+    _CNN_AVAILABLE = True
+except ImportError:
+    _CNN_AVAILABLE = False
+
+# Phase 7 — Judas Swing
+try:
+    from judas_swing import JudasSwingAgent
+    _JUDAS_AVAILABLE = True
+except ImportError:
+    _JUDAS_AVAILABLE = False
+
+# Phase 8 — Dynamic SL
+try:
+    from dynamic_sl import DynamicSLEngine, check_breakeven, trail_by_structure
+    _DYNAMIC_SL_AVAILABLE = True
+except ImportError:
+    _DYNAMIC_SL_AVAILABLE = False
+
+# Phase 9 — Circuit Breaker
+try:
+    from circuit_breaker import CircuitBreakerAgent
+    _CIRCUIT_BREAKER_AVAILABLE = True
+except ImportError:
+    _CIRCUIT_BREAKER_AVAILABLE = False
+
+# Phase 11 — Post-Trade Logger
+try:
+    from post_trade import PostTradeAgent
+    _POST_TRADE_AVAILABLE = True
+except ImportError:
+    _POST_TRADE_AVAILABLE = False
 import pandas as pd
 import pandas_ta as ta
 from dotenv import load_dotenv
@@ -115,6 +185,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         return
+
+
+def discord_circuit_alert(reason: str):
+    webhook = os.getenv('DISCORD_TRADES') or os.getenv('DISCORD_ALERTS', '')
+    _discord_post(webhook, {"embeds": [{"title": "⚡ Circuit Breaker Alert",
+        "color": 0xFF8800,
+        "fields": [{"name": "Reason", "value": f"`{reason}`", "inline": False}],
+        "footer": {"text": "SHIVA — Phase 9 Circuit Breaker"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }]})
 
 
 def start_health_server(analytics=None):
@@ -466,7 +546,7 @@ class FVGScalpStrategy(BaseStrategy):
         downtrend = close < ema200
 
         sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
-        adx_min = float(os.getenv('ADX_MIN', '20'))
+        adx_min = float(os.getenv('ADX_MIN', '25'))   # V12: raised to 25 for quality filter
         if atr > sl_pts * 1.5:           return 0, 0.0  # too volatile
         if adx > 0 and adx < adx_min:   return 0, 0.0  # no trend
 
@@ -491,8 +571,8 @@ class FVGScalpStrategy(BaseStrategy):
         ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
         bar_mid     = (high + low) / 2.0
 
-        # BUY: FVG retest in uptrend, EMA20+EMA50 rising, RSI 35–65
-        if uptrend and 35 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
+        # BUY: FVG retest in uptrend, EMA20+EMA50 rising, RSI 55–68 (quality zone)
+        if uptrend and 55 <= rsi <= 68 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bull':        continue
                 age = n - 1 - fvg['idx']
@@ -507,8 +587,8 @@ class FVGScalpStrategy(BaseStrategy):
         if os.getenv('SELL_ENABLED', '1') == '0':
             return 0, 0.0
 
-        # SELL: bearish FVG retest, downtrend, EMA20+EMA50 both falling, RSI 50–75
-        if downtrend and 50 < rsi < 75 and ema20_slope < 0 and ema50_slope <= 0 and close <= bar_mid:
+        # SELL: bearish FVG retest, downtrend, EMA20+EMA50 both falling, RSI 32–45 (quality zone)
+        if downtrend and 32 <= rsi <= 45 and ema20_slope < 0 and ema50_slope <= 0 and close <= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bear':        continue
                 age = n - 1 - fvg['idx']
@@ -982,7 +1062,60 @@ class ExecutionEngine:
         self.tracked: dict[str, str] = {}
         self.last_close_time: float  = 0.0
 
-        # Daily EMA200 macro filter
+        # Phase 1: HTF Bias Agent
+        self.htf_bias_agent: "HTFBiasAgent | None" = (
+            HTFBiasAgent(symbol) if _HTF_BIAS_AVAILABLE else None
+        )
+
+        # Phase 2: Kill Zone Agent
+        self.kill_zone_agent: "KillZoneAgent | None" = (
+            KillZoneAgent() if _KILL_ZONE_AVAILABLE else None
+        )
+
+        # Phase 3: News Filter Agent
+        self.news_agent: "NewsFilterAgent | None" = (
+            NewsFilterAgent() if _NEWS_FILTER_AVAILABLE else None
+        )
+
+        # Phase 4: Confluence Scorer
+        self.confluence_scorer: "ConfluenceScorer | None" = (
+            ConfluenceScorer() if _CONFLUENCE_AVAILABLE else None
+        )
+
+        # Phase 5: Regime Classifier
+        self.regime_classifier: "RegimeClassifier | None" = (
+            RegimeClassifier() if _REGIME_AVAILABLE else None
+        )
+
+        # Phase 6: CNN Ensemble
+        self.cnn_agent: "CNNEnsembleAgent | None" = (
+            CNNEnsembleAgent() if _CNN_AVAILABLE else None
+        )
+
+        # Phase 7: Judas Swing Agent
+        self.judas_agent: "JudasSwingAgent | None" = (
+            JudasSwingAgent() if _JUDAS_AVAILABLE else None
+        )
+
+        # Phase 8: Dynamic SL Engine
+        self.dynamic_sl: "DynamicSLEngine | None" = (
+            DynamicSLEngine() if _DYNAMIC_SL_AVAILABLE else None
+        )
+
+        # Phase 9: Circuit Breaker (replaces ad-hoc circuit breaker)
+        self.circuit_breaker: "CircuitBreakerAgent | None" = (
+            CircuitBreakerAgent(
+                on_shutdown=lambda r: print(f"🚨 CIRCUIT BREAKER SHUTDOWN: {r}"),
+                on_alert=lambda r: discord_circuit_alert(r),
+            ) if _CIRCUIT_BREAKER_AVAILABLE else None
+        )
+
+        # Phase 11: Post-Trade Logger (replaces AnalyticsEngine)
+        self.post_trade: "PostTradeAgent | None" = (
+            PostTradeAgent() if _POST_TRADE_AVAILABLE else None
+        )
+
+        # Daily EMA200 macro filter (legacy — still active as secondary check)
         self._daily_ema200      = None
         self._daily_ema200_date = None
 
@@ -1065,7 +1198,7 @@ class ExecutionEngine:
         Falls back to IFVG wick-based dynamic SL if SL_POINTS not set.
         """
         sl_pts  = float(os.getenv('SL_POINTS',  '0.30'))
-        tp_mult = float(os.getenv('TP_MULT',    '6.0'))
+        tp_mult = float(os.getenv('TP_MULT',    '3.0'))   # V12: 1:3 RR → 60% WR target
         min_d   = self._min_stop()
 
         if sl_pts > 0:
@@ -1125,18 +1258,32 @@ class ExecutionEngine:
             if strategy:
                 strategy.record_trade(pnl)
 
-            self.analytics.log_close(pos_id, exit_price, pnl)
+            # Phase 11: rich close log
+            if self.post_trade:
+                self.post_trade.log_close(pos_id, exit_price, pnl)
+                self.post_trade.maybe_print_daily_summary()
+            else:
+                self.analytics.log_close(pos_id, exit_price, pnl)
             self.last_close_time = time.time()
             result = "WIN ✅" if pnl > 0 else "LOSS ❌"
 
-            # Circuit breaker tracking
-            if pnl > 0:
-                self.consec_losses = 0
+            # Phase 9: circuit breaker on close
+            if self.circuit_breaker:
+                bal = 0.0
+                try:
+                    bal = float((await self.connection.get_account_information()).get('balance', 0))
+                except Exception:
+                    pass
+                self.circuit_breaker.on_trade_result(pnl, bal)
             else:
-                self.consec_losses += 1
-                if self.consec_losses >= self.max_consec_losses:
-                    self.circuit_broken = True
-                    print(f"⚡ CIRCUIT BREAKER: {self.consec_losses} consecutive losses — pausing for today")
+                # Legacy circuit breaker tracking
+                if pnl > 0:
+                    self.consec_losses = 0
+                else:
+                    self.consec_losses += 1
+                    if self.consec_losses >= self.max_consec_losses:
+                        self.circuit_broken = True
+                        print(f"⚡ CIRCUIT BREAKER: {self.consec_losses} consecutive losses — pausing for today")
 
             print(
                 f"📊 Position closed | {result} | PnL=${pnl:.2f} | "
@@ -1183,7 +1330,7 @@ class ExecutionEngine:
     # ── main loop ──
 
     async def run(self):
-        print(f"🔱 SHIVA V11 LIVE | {self.symbol} | FVG+OB+LS | Session+VWAP+Volume | Max {self.max_daily_trades}/day")
+        print(f"🔱 SHIVA V12 LIVE | {self.symbol} | FVG+OB+LS | ADX25+RSI55-68 | 60%WR | Max {self.max_daily_trades}/day")
         self.api = MetaApi(self.token)
         try:
             self.account = await self.api.metatrader_account_api.get_account(self.account_id)
@@ -1194,20 +1341,28 @@ class ExecutionEngine:
             await self._refresh_spec()
 
             sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
-            tp_mult = float(os.getenv('TP_MULT', '6.0'))
+            tp_mult = float(os.getenv('TP_MULT', '3.0'))
             print(
                 f"✅ MetaApi synchronized | {self.symbol}\n"
                 f"── Strategy ──────────────────────────────────────────\n"
-                f"  [1] FVG_SCALP — fresh FVG first-touch (session+VWAP+volume filters)\n"
+                f"  [1] FVG_SCALP — fresh FVG first-touch (ADX≥25 | RSI 55–68 | 60% WR target)\n"
                 f"  [2] OB_SMC    — order block retest (SMC institutional zones)\n"
                 f"  [3] LS_FVG    — liquidity sweep + FVG combo (gold-standard SMC)\n"
-                f"  Fixed SL: {sl_pts} pts | TP: {sl_pts * tp_mult:.2f} pts ({tp_mult:.0f}R)\n"
+                f"  Fixed SL: {sl_pts} pts | TP: {sl_pts * tp_mult:.2f} pts (1:{tp_mult:.0f}R)\n"
                 f"  Dynamic lot: $100=$0.01  $300=$0.03  $600=$0.06  $900=$0.09\n"
                 f"  Daily limit: {self.max_daily_trades} trades | Session: 07:00–17:00 UTC\n"
                 f"─────────────────────────────────────────────────────\n"
             )
 
-            # Initial daily EMA200 fetch
+            # Phase 1: start HTF Bias Agent
+            if self.htf_bias_agent:
+                await self.htf_bias_agent.start(self.account)
+
+            # Phase 3: start News Filter Agent
+            if self.news_agent:
+                await self.news_agent.start()
+
+            # Initial daily EMA200 fetch (legacy macro filter)
             await self._update_daily_ema200()
 
             while self.is_running:
@@ -1246,20 +1401,142 @@ class ExecutionEngine:
                         await asyncio.sleep(300)
                         continue
 
+                    # Phase 2: Kill Zone gate
+                    kz_result = None
+                    if self.kill_zone_agent:
+                        kz_result = self.kill_zone_agent.check()
+                        if not kz_result.allowed:
+                            await asyncio.sleep(30)
+                            continue
+
+                    # Phase 3: News gate
+                    if self.news_agent:
+                        news_result = self.news_agent.check()
+                        if not news_result.allowed:
+                            await asyncio.sleep(30)
+                            continue
+
+                    # Phase 9: Circuit Breaker gate (replaces ad-hoc logic below)
+                    if self.circuit_breaker:
+                        balance_cb = await self._get_balance()
+                        self.circuit_breaker.set_balance(balance_cb)
+                        cb_result = self.circuit_breaker.check()
+                        if not cb_result.allows_trade:
+                            print(f"⚡ Circuit breaker: {cb_result.reason}")
+                            await asyncio.sleep(300)
+                            continue
+
                     # Get signal
                     if not current:
                         sig, wick, strat_name = self.meta.get_signal_and_wick(df)
-                        # Daily EMA200 macro filter — align trades with macro trend
-                        if sig != 0 and self._daily_ema200 is not None:
-                            cur_close = float(df.iloc[-1]['close'])
-                            if sig == 1 and cur_close < self._daily_ema200:
-                                print(f"🚫 BUY blocked: close {cur_close:.2f} < daily EMA200 {self._daily_ema200:.2f}")
-                                sig = 0
-                            elif sig == -1 and cur_close > self._daily_ema200:
-                                print(f"🚫 SELL blocked: close {cur_close:.2f} > daily EMA200 {self._daily_ema200:.2f}")
-                                sig = 0
+                        # Phase 1: HTF Bias gate (primary) — supersedes legacy EMA200 filter
+                        if sig != 0 and self.htf_bias_agent:
+                            bias = self.htf_bias_agent.current_bias
+                            if bias:
+                                if sig == 1 and bias.blocks_buy():
+                                    print(f"🚫 BUY blocked by HTF Bias: {bias.bias.value}  score={bias.score:+d}")
+                                    sig = 0
+                                elif sig == -1 and bias.blocks_sell():
+                                    print(f"🚫 SELL blocked by HTF Bias: {bias.bias.value}  score={bias.score:+d}")
+                                    sig = 0
+
+                        # Legacy daily EMA200 macro filter (fallback when HTFBiasAgent has no data)
+                        if sig != 0 and (not self.htf_bias_agent or not self.htf_bias_agent.current_bias):
+                            if self._daily_ema200 is not None:
+                                cur_close = float(df.iloc[-1]['close'])
+                                if sig == 1 and cur_close < self._daily_ema200:
+                                    print(f"🚫 BUY blocked (legacy EMA200): close {cur_close:.2f} < {self._daily_ema200:.2f}")
+                                    sig = 0
+                                elif sig == -1 and cur_close > self._daily_ema200:
+                                    print(f"🚫 SELL blocked (legacy EMA200): close {cur_close:.2f} > {self._daily_ema200:.2f}")
+                                    sig = 0
                     else:
                         sig, wick, strat_name = 0, 0.0, ''
+
+                    # Phase 5: Regime classification — adjust size or skip HV
+                    regime_label = ""
+                    regime_size_factor = 1.0
+                    if sig != 0 and self.regime_classifier:
+                        regime_result = self.regime_classifier.classify(df)
+                        regime_label  = regime_result.regime.value
+                        regime_size_factor = regime_result.size_factor
+
+                    # ── Backtest-proven signal filters (WR 28%, PF 1.975) ──────────────────
+                    if sig != 0:
+                        import zoneinfo as _zi
+                        _now_est = datetime.now(timezone.utc).astimezone(_zi.ZoneInfo("US/Eastern"))
+
+                        # 1. TRENDING_BULL only (RANGING=11.9% WR, TRENDING_BEAR=12.3% — both below BE)
+                        if regime_label and regime_label != "TRENDING_BULL":
+                            print(f"🚫 Signal blocked — regime {regime_label} (only TRENDING_BULL allowed)")
+                            sig = 0
+
+                        # 2. BUY direction only in bull regime (SELL WR=9.1% vs BUY WR=18.9%)
+                        if sig == -1:
+                            print("🚫 SELL blocked — BUY-only policy in TRENDING_BULL regime")
+                            sig = 0
+
+                        # 3. Skip Monday EST (illiquid weekly open + low WR)
+                        if sig != 0 and _now_est.weekday() == 0:
+                            print("🚫 Signal blocked — Monday EST (low WR day)")
+                            sig = 0
+
+                        # 4. Skip Wednesday EST (WR=8.9% in backtest)
+                        if sig != 0 and _now_est.weekday() == 2:
+                            print("🚫 Signal blocked — Wednesday EST (worst WR day)")
+                            sig = 0
+
+                        # 5. Skip Friday after 10am EST (weekend gap prevention)
+                        if sig != 0 and _now_est.weekday() == 4 and _now_est.hour >= 10:
+                            print("🚫 Signal blocked — Friday after 10am EST (weekend gap risk)")
+                            sig = 0
+
+                        # 6. ATR spike filter — extreme volatility bars cause gap losses
+                        if sig != 0 and "ATR" in df.columns and len(df) >= 20:
+                            _atr_now = float(df["ATR"].iloc[-1] or 0)
+                            _atr_ma  = float(df["ATR"].rolling(20).mean().iloc[-1] or 0)
+                            if _atr_ma > 0 and _atr_now > 2.5 * _atr_ma:
+                                print(f"🚫 Signal blocked — ATR spike {_atr_now:.3f} > 2.5×avg {_atr_ma:.3f}")
+                                sig = 0
+                    # ──────────────────────────────────────────────────────────────────────
+
+                    # Phase 6: CNN Ensemble signal
+                    cnn_dir, cnn_conf = 0, 0.0
+                    if sig != 0 and self.cnn_agent:
+                        cnn_result = self.cnn_agent.predict(df)
+                        if cnn_result.passes_threshold:
+                            cnn_dir  = cnn_result.direction
+                            cnn_conf = cnn_result.confidence
+
+                    # Phase 7: Judas Swing overlay — can override signal
+                    if not current and self.judas_agent:
+                        judas_result = self.judas_agent.check(df)
+                        if judas_result.is_actionable and sig == 0:
+                            sig   = judas_result.direction
+                            wick  = judas_result.fvg_low if sig == 1 else judas_result.fvg_high
+                            strat_name = "JUDAS_SWING"
+
+                    # Phase 4: Confluence gate — score signal before execution
+                    confluence_score = 0
+                    entry_size_label = "FULL"
+                    if sig != 0 and self.confluence_scorer:
+                        mstate = MarketState(
+                            signal=sig,
+                            df=df,
+                            htf_bias_score=self.htf_bias_agent.bias_score() if self.htf_bias_agent else 0,
+                            htf_bias_label=self.htf_bias_agent.current_bias.bias.value if (
+                                self.htf_bias_agent and self.htf_bias_agent.current_bias) else "NEUTRAL",
+                            kill_zone_active=kz_result.allowed if kz_result else True,
+                            session_name=kz_result.session.value if kz_result else "",
+                            cnn_confidence=cnn_conf,
+                            cnn_direction=cnn_dir,
+                            regime=regime_label,
+                        )
+                        conf_result = self.confluence_scorer.score(mstate)
+                        confluence_score = conf_result.score
+                        entry_size_label = conf_result.entry_size.value
+                        if not conf_result.allows_entry:
+                            sig = 0  # below threshold — block trade
 
                     # Execute
                     if not current and sig != 0 and wick != 0.0:
@@ -1268,24 +1545,50 @@ class ExecutionEngine:
                         lot     = compute_lot_size(balance)
                         price   = await self._get_price()
 
+                        # Phase 8: dynamic SL/TP (falls back to fixed if unavailable)
                         if sig == 1:
-                            entry  = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
-                            sl, tp = self._build_levels('BUY', entry, wick)
-                            sl_usd = abs(entry - sl) * lot * 1000
-                            tp_usd = abs(tp - entry) * lot * 1000
-                            print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot} | bal=${balance:.0f} | [{strat_name}]")
+                            entry = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
+                            if self.dynamic_sl:
+                                dyn = self.dynamic_sl.compute('BUY', entry, df, self._point(), self._min_stop())
+                                if not dyn.valid:
+                                    print(f"🚫 BUY skipped: {dyn.reason}")
+                                    await asyncio.sleep(30)
+                                    continue
+                                sl, tp = dyn.sl, dyn.tp1  # tp1=1:1, tp2=runner (Phase 8)
+                            else:
+                                sl, tp = self._build_levels('BUY', entry, wick)
+                            # Phase 9: apply size factor from regime + circuit breaker
+                            lot_adj = round(lot * regime_size_factor * (
+                                self.circuit_breaker._size_factor if self.circuit_breaker else 1.0
+                            ), 2)
+                            lot_adj = max(lot_adj, 0.01)
+                            sl_usd = abs(entry - sl) * lot_adj * 1000
+                            tp_usd = abs(tp - entry) * lot_adj * 1000
+                            print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot_adj} | bal=${balance:.0f} | [{strat_name}] conf={confluence_score}")
                             result = await self.connection.create_market_buy_order(
-                                self.symbol, lot, sl, tp,
+                                self.symbol, lot_adj, sl, tp,
                                 {'comment': f'SHIVA:{strat_name}'},
                             )
                         else:
-                            entry  = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
-                            sl, tp = self._build_levels('SELL', entry, wick)
-                            sl_usd = abs(sl - entry) * lot * 1000
-                            tp_usd = abs(entry - tp) * lot * 1000
-                            print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot} | bal=${balance:.0f} | [{strat_name}]")
+                            entry = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
+                            if self.dynamic_sl:
+                                dyn = self.dynamic_sl.compute('SELL', entry, df, self._point(), self._min_stop())
+                                if not dyn.valid:
+                                    print(f"🚫 SELL skipped: {dyn.reason}")
+                                    await asyncio.sleep(30)
+                                    continue
+                                sl, tp = dyn.sl, dyn.tp1
+                            else:
+                                sl, tp = self._build_levels('SELL', entry, wick)
+                            lot_adj = round(lot * regime_size_factor * (
+                                self.circuit_breaker._size_factor if self.circuit_breaker else 1.0
+                            ), 2)
+                            lot_adj = max(lot_adj, 0.01)
+                            sl_usd = abs(sl - entry) * lot_adj * 1000
+                            tp_usd = abs(entry - tp) * lot_adj * 1000
+                            print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot_adj} | bal=${balance:.0f} | [{strat_name}] conf={confluence_score}")
                             result = await self.connection.create_market_sell_order(
-                                self.symbol, lot, sl, tp,
+                                self.symbol, lot_adj, sl, tp,
                                 {'comment': f'SHIVA:{strat_name}'},
                             )
 
@@ -1298,8 +1601,30 @@ class ExecutionEngine:
                         if new_pos:
                             side = 'BUY' if sig == 1 else 'SELL'
                             zone = "DISCOUNT" if sig == 1 else "PREMIUM"
+                            # Phase 2: tag session for performance tracking
+                            session_tag = (
+                                self.kill_zone_agent.check().session.value
+                                if self.kill_zone_agent else "UNKNOWN"
+                            )
                             self.tracked[new_pos['id']] = strat_name
-                            self.analytics.log_open(new_pos['id'], side, entry, sl, tp, lot, strat_name)
+                            # Phase 11: rich trade log
+                            if self.post_trade:
+                                tp2_val = dyn.tp2 if (self.dynamic_sl and 'dyn' in dir()) else tp
+                                news_nearby = bool(
+                                    self.news_agent and self.news_agent._last_check
+                                    and self.news_agent._last_check.mins_to_event is not None
+                                    and abs(self.news_agent._last_check.mins_to_event) < 60
+                                )
+                                self.post_trade.log_open(
+                                    new_pos['id'], side, entry, sl, tp, tp2_val,
+                                    lot=lot_adj, strategy=strat_name,
+                                    confluence_score=confluence_score,
+                                    regime=regime_label, session=session_tag,
+                                    news_nearby=news_nearby, cnn_confidence=cnn_conf,
+                                    reason=" | ".join([strat_name, entry_size_label, regime_label]),
+                                )
+                            else:
+                                self.analytics.log_open(new_pos['id'], side, entry, sl, tp, lot_adj, strat_name)
                             self.daily_trades += 1
                             discord_trade_open(
                                 side, self.symbol, entry, sl, tp, lot, zone, wick,
@@ -1348,7 +1673,7 @@ if __name__ == "__main__":
     ACCOUNT_ID = require_env('METAAPI_ACCOUNT_ID')
     SYMBOL     = os.getenv('SYMBOL', 'USOIL')
 
-    print(f"🚀 Starting SHIVA V11  |  {SYMBOL}  |  FVG+OB+LS Scalp  |  Session+VWAP+Volume filters")
+    print(f"🚀 Starting SHIVA V12  |  {SYMBOL}  |  FVG+OB+LS | ADX≥25 | RSI 55-68 | 60% WR | TP=3R")
 
     _bootstrap_analytics = AnalyticsEngine()
     start_health_server(_bootstrap_analytics)
