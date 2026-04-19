@@ -3,6 +3,9 @@ pandas
 pandas_ta
 python-dotenv
 numpy
+polars
+pyyaml
+tzdata
 
 # Optional — AI layer (enable with KRONOS_ENABLED=true)
 # torch             (install separately: pip install torch --index-url https://download.pytorch.org/whl/cu121)
