@@ -326,8 +326,8 @@
                     updateLivePositions(data.livePositions || []);
                     updateTradeLogs(data.recentTrades);
                     updateBotLogs(data.botLogs || []);
-                    updateAgentMessages(data.recentAgentMessages || data.agentMessages || []);
-                    fetchAgentData();
+                    const latestAgentPayload = (data.recentAgentMessages || data.agentMessages || [])[0];
+                    if (latestAgentPayload) updateAgentTerminal(latestAgentPayload);
                     document.getElementById('connection-status').textContent = 'Connected';
                     document.getElementById('connection-status').style.color = '#00ff88';
                     document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
@@ -451,24 +451,6 @@
             `}).join('');
         }
 
-        // Fetch agent data from Upstash Redis (Railway bot source)
-        async function fetchAgentData() {
-            try {
-                const UPSTASH_URL = 'https://growing-crow-80382.upstash.io';
-                const UPSTASH_TOKEN = 'gQAAAAAAATn-AAIncDJlNjdjM2M4OTQzOTg0OGRhYjE3MzRjNjNhM2U1ZDUzNnAyODAzODI';
-
-                const req = new Request(`${UPSTASH_URL}/get/shiva:agent_messages`, {
-                    headers: { 'Authorization': `Bearer ${UPSTASH_TOKEN}` }
-                });
-                const resp = await fetch(req);
-                const data = await resp.json();
-                const result = data.result ? JSON.parse(data.result) : null;
-                if (result) updateAgentTerminal(result);
-            } catch (e) {
-                console.error('Agent fetch error:', e);
-            }
-        }
-
         function updateAgentTerminal(data) {
             const container = document.getElementById('agent-messages');
             if (!container || !data) return;
@@ -492,7 +474,11 @@
 
             html += `📊 ICT ANALYSIS\n`;
             html += `   Signal: ${ict.signal || '—'} | Confidence: ${ict.confidence ?? '—'}%\n`;
-            html += `   Phase: ${ict.phase || '—'} | IFVGs: ${ict.ifvgs ?? '—'}\n\n`;
+            html += `   Phase: ${ict.phase || '—'} | IFVGs: ${ict.ifvgs ?? '—'}\n`;
+            if (ict.reasons && ict.reasons.length) {
+                html += `   Why: ${ict.reasons.join(' | ')}\n`;
+            }
+            html += `\n`;
 
             html += `🤖 40 AGENT VOTES\n`;
             html += `   🟢 BUY:  ${buyAgents.length}  🔴 SELL: ${sellAgents.length}  ⚪ HOLD: ${holdAgents.length}\n`;
@@ -562,12 +548,11 @@
         }
 
         function startAutoRefresh() {
-            autoRefreshInterval = setInterval(() => { fetchData(); fetchAgentData(); }, 5000); // Refresh every 5 seconds
+            autoRefreshInterval = setInterval(() => { fetchData(); }, 5000); // Refresh every 5 seconds
         }
 
         // Initial load
         fetchData();
-        fetchAgentData();
         startAutoRefresh();
     </script>
 </body>

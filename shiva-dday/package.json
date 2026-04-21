@@ -1,0 +1,9 @@
+{
+  "name": "shiva-godmode-overlord-dday",
+  "dependencies": {
+    "@upstash/redis": "^1.37.0",
+    "dotenv": "^17.4.1",
+    "metaapi.cloud-sdk": "*",
+    "node-fetch": "^2.6.1"
+  }
+}

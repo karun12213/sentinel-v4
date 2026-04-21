@@ -1,0 +1,13 @@
+{
+  "weights": {
+    "SELL": {
+      "wins": 0,
+      "losses": 5,
+      "total": 5,
+      "avgBuyRatio": 0.365,
+      "winRate": 0
+    }
+  },
+  "winRate": 0,
+  "totalTrades": 5
+}

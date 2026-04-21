@@ -1,0 +1,20 @@
+#!/bin/bash
+cd /Users/karunaditya/shiva-dday
+
+# Kill old processes
+pkill -f push_octafx_live 2>/dev/null
+pkill -f shiva_vercel_sync 2>/dev/null
+sleep 2
+
+# Read token from file
+export METAAPI_TOKEN=$(grep '^METAAPI_TOKEN=' ~/.shiva_env | head -1 | sed 's/^METAAPI_TOKEN=//')
+export METAAPI_ACCOUNT_ID=381743bc-f3c9-4b59-af77-37806fc89839
+export VERCEL_URL=https://shiva-godmode-overlord-dday.vercel.app
+
+echo "🚀 Starting OctaFX Live → Vercel..."
+nohup node push_octafx_live.js > logs/octafx_live.log 2>&1 &
+echo "PID: $!"
+
+# Wait and check
+sleep 15
+tail -5 logs/octafx_live.log

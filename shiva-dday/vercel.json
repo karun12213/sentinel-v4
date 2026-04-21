@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "name": "shiva-godmode-overlord-dday",
+  "builds": [
+    { "src": "api/index.js", "use": "@vercel/node" },
+    { "src": "index.html", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/index.js" },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ],
+  "crons": [
+    {
+      "path": "/api/scan",
+      "schedule": "*/5 * * * *"
+    }
+  ],
+  "regions": ["fra1"],
+  "env": {
+    "SYMBOL": "USOIL",
+    "LOT_SIZE": "0.01",
+    "POSITIONS": "0"
+  }
+}
