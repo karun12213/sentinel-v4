@@ -594,75 +594,6 @@ class FVGScalpStrategy(BaseStrategy):
 
 
 # ─────────────────────────────────────────────
-# EMA BOUNCE STRATEGY  (frequency — EMA20 dynamic S/R crosses)
-# ─────────────────────────────────────────────
-class EMABounceStrategy(BaseStrategy):
-    """
-    EMA20 dynamic support/resistance bounce.
-    BUY:  prev close < EMA20, current close > EMA20 + bullish candle (uptrend)
-    SELL: prev close > EMA20, current close < EMA20 + bearish candle (downtrend)
-    ATR filter same as FVGScalpStrategy.
-    Provides 3-5 extra signals per day on 5m.
-    """
-    def __init__(self):
-        super().__init__("EMA_BOUNCE")
-
-    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
-        if len(df) < 60:
-            return 0, 0.0
-
-        r    = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        close  = float(r['close'])
-        open_  = float(r['open'])
-        high   = float(r['high'])
-        low    = float(r['low'])
-        ema20  = float(r.get('EMA_20', close) or close)
-        ema50  = float(r.get('EMA_50', close) or close)
-        ema200 = float(r.get('EMA_200', close) or close)
-        atr    = float(r.get('ATR', 0) or 0)
-        adx    = float(r.get('ADX_14', 0) or 0)
-        rsi    = float(r.get('RSI', 50) or 50)
-
-        prev_close = float(prev['close'])
-        prev_ema20 = float(prev.get('EMA_20', prev_close) or prev_close)
-
-        bar_mid   = (high + low) / 2.0
-        uptrend   = close > ema200
-        downtrend = close < ema200
-        ema20_slope = ema20 - prev_ema20
-        ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
-
-        # BUY: EMA20 bounce in uptrend
-        if (uptrend and
-                30 < rsi < 75 and
-                prev_close < prev_ema20 and
-                close > ema20 and
-                close > open_ and
-                close >= bar_mid):
-            wick = low
-            print(f"  🟦 EMA BOUNCE BUY  close={close:.3f} > EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
-            return 1, wick
-
-        if os.getenv('SELL_ENABLED', '1') == '0':
-            return 0, 0.0
-
-        # SELL: EMA20 rejection in downtrend
-        if (downtrend and
-                25 < rsi < 80 and
-                prev_close > prev_ema20 and
-                close < ema20 and
-                close < open_ and
-                close <= bar_mid):
-            wick = high
-            print(f"  🟧 EMA BOUNCE SELL close={close:.3f} < EMA20={ema20:.3f}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
-            return -1, wick
-
-        return 0, 0.0
-
-
-# ─────────────────────────────────────────────
 # ORDER BLOCK STRATEGY  (SMC — last opposing candle before impulse)
 # ─────────────────────────────────────────────
 class OrderBlockStrategy(BaseStrategy):
@@ -2097,20 +2028,7 @@ class ExecutionEngine:
                                 elif sig == -1 and cur_close > self._daily_ema200:
                                     print(f"🚫 SELL blocked (legacy EMA200): close {cur_close:.2f} > {self._daily_ema200:.2f}")
                                     sig = 0
-                        # Macro EMA+RSI fallback when SMC strategies find nothing
-                        if sig == 0:
-                            _r     = df.iloc[-1]
-                            _close = float(_r['close'])
-                            _ema200= float(_r.get('EMA_200', _close) or _close)
-                            _rsi   = float(_r.get('RSI', 50) or 50)
-                            _low   = float(_r['low'])
-                            _high  = float(_r['high'])
-                            if _close > _ema200 and 30 <= _rsi <= 75:
-                                sig, wick, strat_name = 1, _low, 'TREND_EMA_BULL'
-                                print(f"📈 Macro fallback BUY  close={_close:.3f} EMA200={_ema200:.3f} RSI={_rsi:.1f}")
-                            elif _close < _ema200 and 25 <= _rsi <= 70:
-                                sig, wick, strat_name = -1, _high, 'TREND_EMA_BEAR'
-                                print(f"📉 Macro fallback SELL close={_close:.3f} EMA200={_ema200:.3f} RSI={_rsi:.1f}")
+                        # ICT-only: no EMA fallback — wait for clean SMC setup
                     else:
                         sig, wick, strat_name = 0, 0.0, ''
 
