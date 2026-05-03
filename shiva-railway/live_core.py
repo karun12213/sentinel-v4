@@ -45,6 +45,13 @@ try:
 except ImportError:
     _NEWS_FILTER_AVAILABLE = False
 
+# ML Engine — online learning filter
+try:
+    from ml_engine import MLTradeFilter
+    _ML_AVAILABLE = True
+except ImportError:
+    _ML_AVAILABLE = False
+
 # Phase 4 — Confluence Scorer
 try:
     from confluence import ConfluenceScorer, MarketState, EntrySize
@@ -1510,7 +1517,13 @@ class ExecutionEngine:
         self.ict_session      = ICTSessionFilter()
         self.event_horizon    = EventHorizonDetector()
         self.lunch_fvg        = LunchFVGTracker()
-        self.analytics     = AnalyticsEngine()
+        self.analytics        = AnalyticsEngine()
+
+        # ML online-learning filter
+        self.ml_filter: "MLTradeFilter | None" = (
+            MLTradeFilter() if _ML_AVAILABLE else None
+        )
+        self._ml_pending: dict = {}   # features for open trade → record result on close
 
         self.connection  = None
         self.account     = None
@@ -1714,6 +1727,14 @@ class ExecutionEngine:
                 self.analytics.log_close(pos_id, exit_price, pnl)
             self.last_close_time = time.time()
             result = "WIN ✅" if pnl > 0 else "LOSS ❌"
+
+            # ML: record result for closed trade and retrain if needed
+            if self.ml_filter and pos_id in self._ml_pending:
+                label = 1 if pnl > 0 else 0
+                self.ml_filter.add_result(self._ml_pending.pop(pos_id), label)
+                s = self.ml_filter.stats
+                print(f"🧠 ML updated | trades={s['total']} WR={s['wr']}% "
+                      f"trained={s['trained']} cv_acc={s.get('cv_acc',0)}%")
 
             # Phase 9: circuit breaker on close
             if self.circuit_breaker:
@@ -2092,6 +2113,17 @@ class ExecutionEngine:
                         mtf_ok, mtf_reason = self._check_mtf_zone(mtf_zones, side_str)
                         print(f"{'✅' if mtf_ok else '⚠️ '} MTF zone: {mtf_reason}")
 
+                    # ML gate — predict WIN probability, block low-confidence trades
+                    ml_conf, ml_ok = 0.5, True
+                    ml_features    = None
+                    if sig != 0 and self.ml_filter:
+                        ml_features = self.ml_filter.extract_features(df, sig)
+                        ml_conf, ml_ok = self.ml_filter.predict(ml_features)
+                        if not ml_ok:
+                            print(f"🧠 ML gate blocked {strat_name} {'BUY' if sig==1 else 'SELL'} "
+                                  f"(conf={ml_conf:.0%} < {self.ml_filter.threshold:.0%})")
+                            sig = 0
+
                     # Execute
                     if not current and sig != 0 and wick != 0.0:
                         balance = await self._get_balance()
@@ -2141,6 +2173,9 @@ class ExecutionEngine:
                             None,
                         )
                         if new_pos:
+                            # Store ML features so result can be recorded on close
+                            if self.ml_filter and ml_features:
+                                self._ml_pending[new_pos['id']] = ml_features
                             side = 'BUY' if sig == 1 else 'SELL'
                             zone = "DISCOUNT" if sig == 1 else "PREMIUM"
                             # Phase 2: tag session for performance tracking

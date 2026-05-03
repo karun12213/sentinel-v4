@@ -35,6 +35,11 @@ from live_core import (FeatureEngine, FVGScalpStrategy,
                         OrderBlockStrategy, LiquiditySweepFVGStrategy,
                         SuspensionBlockStrategy, ICTSessionFilter,
                         compute_lot_size)
+try:
+    from ml_engine import MLTradeFilter
+    _ML_OK = True
+except ImportError:
+    _ML_OK = False
 
 
 # ─────────────────────────────────────────────
@@ -94,11 +99,11 @@ def run(df: pd.DataFrame, label: str,
         cooldown_bars: int = 1,
         max_daily_trades: int = 9,
         strategy_list=None,
-        daily_ema200: pd.Series = None) -> pd.DataFrame:
+        daily_ema200: pd.Series = None,
+        use_ml: bool = True) -> pd.DataFrame:
     """
     daily_ema200: optional Series (daily index) of EMA200 values for macro trend filter.
-    When provided, BUY only if close > daily_ema200, SELL only if close < daily_ema200.
-    Overrides the intraday EMA200 used by strategies for trend alignment.
+    use_ml: enable online ML learning loop (trains on trade history, gates low-conf signals).
     """
     if df.empty:
         print(f"  [SKIP] {label} — no data")
@@ -109,6 +114,12 @@ def run(df: pd.DataFrame, label: str,
         OrderBlockStrategy(), FVGScalpStrategy(),
     ]
     ict_session = ICTSessionFilter()
+    # Fresh ML filter per backtest run (no disk state — simulates live learning from scratch)
+    ml = MLTradeFilter() if (_ML_OK and use_ml) else None
+    if ml:
+        import os; ml._save = lambda: None   # disable disk writes during backtest
+        ml.buffer = []                        # start clean — no pre-loaded history
+        ml.trained = False
     warmup          = 215   # EMA-200 + indicators need ~200 bars
     max_consec_loss = 3     # circuit breaker threshold
 
@@ -173,6 +184,9 @@ def run(df: pd.DataFrame, label: str,
                     'result':     result,
                 })
                 last_close_bar = i
+                # ML: feed closed trade result back into learning loop
+                if ml and position and position.get('ml_features'):
+                    ml.add_result(position['ml_features'], 1 if pnl_val > 0 else 0)
                 position = None
 
                 # Circuit breaker tracking
@@ -249,6 +263,14 @@ def run(df: pd.DataFrame, label: str,
             if sig == 0:
                 continue
 
+            # ML gate — only active after MIN_TRADES history
+            ml_features = None
+            if ml:
+                ml_features = ml.extract_features(feat, sig)
+                ml_conf, ml_ok = ml.predict(ml_features)
+                if not ml_ok:
+                    continue   # ML blocked low-confidence signal
+
             entry = float(bar['close'])
             side  = 'BUY' if sig == 1 else 'SELL'
             lot   = compute_lot_size(capital)
@@ -271,6 +293,7 @@ def run(df: pd.DataFrame, label: str,
                 'entry_bar':  i,
                 'entry_time': str(t),
                 'strategy':   strat_name,
+                'ml_features': ml_features,
             }
 
     # Close any open position at last bar
