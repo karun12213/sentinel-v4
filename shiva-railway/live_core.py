@@ -1,11 +1,10 @@
 """
-SHIVA V13 — ICT SMC Full Stack | AMD Cycle | Asian Judas | OTE | Suspension Block
-Updated from 103 ICT transcripts (2023–2026 Mentorship + W.E.N.T. + Scout Sniper).
-
-Entry models: FVG_SCALP, OB_SMC, LS_FVG, JUDAS_SWING, OTE (62-79% Fib), SUSPENSION_BLOCK, ASIAN_JUDAS
-New filters:  AMD session gate, DOW rules, TGIF Friday fade, Event Horizon, Asian range Judas
-New concepts: CE partial exit (50% of FVG), NY lunch carry-forward FVG, PD array age decay
-Kill zones:   Asian 7PM-9PM, London 2AM-4AM, NY Open 9:30-10:30AM, 2PM macro, PM sweet 3PM-3:45PM
+SHIVA V13 BEST — ICT Best-Strategy Config (9-month backtest validated)
+BUY:  LS_FVG + OB_SMC + FVG_SCALP  — only above daily EMA200
+SELL: SUSPENSION_BLOCK only          — only below daily EMA200
+OTE and ASIAN_JUDAS removed (underperformers, 9-month backtest)
+Filters: AMD session gate, DOW rules, TGIF Friday fade, Event Horizon, Lunch carry-forward FVG
+Kill zones: Asian 7PM-9PM, London 2AM-4AM, NY Open 9:30-10:30AM, 2PM macro, PM sweet 3PM-3:45PM
 """
 import asyncio
 import json
@@ -1494,20 +1493,17 @@ class ExecutionEngine:
         self.symbol     = symbol
         self.is_running = True
 
-        # V13: Full ICT stack — FVG+OB+LS+JUDAS+OTE+ASIAN_JUDAS+SUSPENSION_BLOCK
+        # V13 BEST: BUY=LS_FVG+OB_SMC+FVG_SCALP (above EMA200), SELL=SuspensionBlock (below EMA200)
+        # OTE and ASIAN_JUDAS removed — underperformers in 9-month backtest
         self.fvg_scalp        = FVGScalpStrategy()
         self.ob_smc           = OrderBlockStrategy()
         self.ls_fvg           = LiquiditySweepFVGStrategy()
-        self.ote_strat        = OTEStrategy()
-        self.asian_judas      = AsianRangeJudasStrategy()
         self.suspension_block = SuspensionBlockStrategy()
         self.meta = MetaController([
-            self.ls_fvg,           # highest conviction: liquidity sweep + FVG
-            self.asian_judas,      # Judas model: Asian range sweep → NY reversal
-            self.ote_strat,        # OTE: 62–79% Fibonacci retracement entry
-            self.suspension_block, # premium resistance short (ATH/rejection block)
-            self.ob_smc,           # order block retest
-            self.fvg_scalp,        # fresh FVG first-touch scalp
+            self.ls_fvg,           # highest conviction: liquidity sweep + FVG (BUY-only above EMA200)
+            self.suspension_block, # premium resistance short — SELL-only below EMA200
+            self.ob_smc,           # order block retest (BUY-only above EMA200)
+            self.fvg_scalp,        # fresh FVG first-touch scalp (BUY-only above EMA200)
         ])
 
         # New ICT filter modules
@@ -1979,6 +1975,23 @@ class ExecutionEngine:
                             sig, wick, strat_name = lunch_sig, lunch_wick, 'LUNCH_CARRY_FVG'
                         else:
                             sig, wick, strat_name = self.meta.get_signal_and_wick(df)
+
+                        # Per-strategy EMA200 gate (best-strategy config):
+                        # BUY strategies (LS_FVG, OB_SMC, FVG_SCALP) only fire above daily EMA200
+                        # SELL strategies (SUSPENSION_BLOCK) only fire below daily EMA200
+                        if sig != 0 and self._daily_ema200 is not None:
+                            _cc = float(df.iloc[-1]['close'])
+                            _buy_strats  = {'LS_FVG', 'OB_SMC', 'FVG_SCALP', 'LUNCH_CARRY_FVG'}
+                            _sell_strats = {'SUSPENSION_BLOCK'}
+                            if sig == 1 and strat_name in _buy_strats and _cc < self._daily_ema200:
+                                print(f"🚫 {strat_name} BUY blocked: below daily EMA200 ({_cc:.2f} < {self._daily_ema200:.2f})")
+                                sig = 0
+                            elif sig == -1 and strat_name in _sell_strats and _cc > self._daily_ema200:
+                                print(f"🚫 {strat_name} SELL blocked: above daily EMA200 ({_cc:.2f} > {self._daily_ema200:.2f})")
+                                sig = 0
+                            elif sig == -1 and strat_name not in _sell_strats:
+                                print(f"🚫 {strat_name} SELL blocked: not a designated SELL strategy in best config")
+                                sig = 0
 
                         # Event Horizon gate: skip if price is at BSL/SSL midpoint
                         if sig != 0:

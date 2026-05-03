@@ -31,8 +31,10 @@ except ImportError:
     print("pip install yfinance"); sys.exit(1)
 
 sys.path.insert(0, os.path.dirname(__file__))
-from live_core import (FeatureEngine, FVGScalpStrategy, EMABounceStrategy,
-                        OrderBlockStrategy, LiquiditySweepFVGStrategy, compute_lot_size)
+from live_core import (FeatureEngine, FVGScalpStrategy,
+                        OrderBlockStrategy, LiquiditySweepFVGStrategy,
+                        SuspensionBlockStrategy, ICTSessionFilter,
+                        compute_lot_size)
 
 
 # ─────────────────────────────────────────────
@@ -102,7 +104,11 @@ def run(df: pd.DataFrame, label: str,
         print(f"  [SKIP] {label} — no data")
         return pd.DataFrame()
 
-    strategies = strategy_list if strategy_list is not None else [FVGScalpStrategy(), EMABounceStrategy()]
+    strategies = strategy_list if strategy_list is not None else [
+        LiquiditySweepFVGStrategy(), SuspensionBlockStrategy(),
+        OrderBlockStrategy(), FVGScalpStrategy(),
+    ]
+    ict_session = ICTSessionFilter()
     warmup          = 215   # EMA-200 + indicators need ~200 bars
     max_consec_loss = 3     # circuit breaker threshold
 
@@ -183,8 +189,27 @@ def run(df: pd.DataFrame, label: str,
         if position is None and (i - last_close_bar) >= cooldown_bars:
             if daily_counts[date] >= max_daily_trades:
                 continue
-            if date in daily_broken:          # circuit breaker — sit out rest of day
+            if date in daily_broken:
                 continue
+
+            # ICT session gate: skip Asian accumulation, NY lunch, Monday open
+            import pytz
+            try:
+                _est = pytz.timezone('US/Eastern')
+                _t_est = t.tz_convert(_est) if hasattr(t, 'tz_convert') else t
+                _h = _t_est.hour; _m = _t_est.minute; _tm = _h*60+_m
+                _dow = _t_est.weekday()
+                # Block Asian accumulation (7PM–2AM)
+                if _tm >= 1140 or _tm < 120:
+                    continue
+                # Block NY lunch re-accumulation (12PM–1:30PM)
+                if 720 <= _tm < 810:
+                    continue
+                # Block Monday first 30min
+                if _dow == 0 and _tm < 570:
+                    continue
+            except Exception:
+                pass
 
             window = df.iloc[:i + 1].copy()
             try:
@@ -198,18 +223,24 @@ def run(df: pd.DataFrame, label: str,
             for strat in strategies:
                 s_sig, s_wick = strat.get_signal_and_wick(feat)
                 if s_sig != 0:
-                    # Apply daily macro trend filter when provided
+                    # Per-strategy EMA200 gate (V13 BEST config):
+                    # BUY strategies: only fire above daily EMA200
+                    # SELL: only SuspensionBlock fires, only below daily EMA200
+                    _buy_strats  = {'LS_FVG', 'OB_SMC', 'FVG_SCALP'}
+                    _sell_strats = {'SUSPENSION_BLOCK'}
+                    _sname = strat.name
+                    if s_sig == -1 and _sname not in _sell_strats:
+                        continue   # only SuspensionBlock can SELL
                     if daily_ema200 is not None:
                         cur_close = float(bar['close'])
-                        # Find the daily EMA200 for this bar's date (most recent available)
                         try:
                             d_ema_avail = daily_ema200[daily_ema200.index <= pd.Timestamp(date)]
                             if not d_ema_avail.empty:
                                 d_ema_val = float(d_ema_avail.iloc[-1])
                                 if s_sig == 1 and cur_close < d_ema_val:
-                                    continue   # macro downtrend — skip BUY
+                                    continue   # BUY blocked below EMA200
                                 if s_sig == -1 and cur_close > d_ema_val:
-                                    continue   # macro uptrend — skip SELL
+                                    continue   # SuspensionBlock SELL blocked above EMA200
                         except Exception:
                             pass
                     sig, wick, strat_name = s_sig, s_wick, strat.name
@@ -408,8 +439,9 @@ def project_to_500_per_week(ev_per_trade: float, trades_per_week: float,
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
     print("=" * 70)
-    print("  SHIVA V6 — FVG Scalp + EMA Bounce | Dynamic Lot | 9-Month Backtest")
-    print("  Asset: USOIL (CL=F)  |  $100 capital  |  SL=$3→scales  TP=$18→scales")
+    print("  SHIVA V13 — ICT Full Stack | 9-Month Backtest | USOIL (CL=F)")
+    print("  Strategies: LS_FVG + OTE + ASIAN_JUDAS + SUSPENSION_BLOCK + OB + FVG")
+    print("  Filters: ICT session gate (no Asian/Lunch) | DOW rules | Daily EMA200")
     print("=" * 70)
     print()
 
@@ -439,54 +471,38 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"   ⚠️  Daily EMA200 failed: {e}")
 
-    # 1h: BUY-only (SELL unreliable on hourly USOIL — whipsaw dominates)
-    # SL=0.50pt (1h bar range 0.5-1pt; 0.30pt = noise on hourly)  TP=3.0pt  RR 1:6
-    os.environ['SL_POINTS']    = '0.50'
-    os.environ['MIN_ATR']      = '0.0'
-    os.environ['ADX_MIN']      = '20'
-    os.environ['SELL_ENABLED'] = '0'
+    # V13 BEST: BUY=LS_FVG+OB_SMC+FVG_SCALP (above EMA200), SELL=SuspensionBlock (below EMA200)
+    os.environ['SELL_ENABLED'] = '1'
+    BEST_STRATS = [
+        LiquiditySweepFVGStrategy(),
+        SuspensionBlockStrategy(),
+        OrderBlockStrategy(),
+        FVGScalpStrategy(),
+    ]
     trades_1h = run(
         df_1h,
-        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [FVG+OB+LS BUY-only | Session+VWAP+Volume | SL=0.50pt]',
+        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [V13 BEST: LS_FVG+OB+FVG(BUY>EMA200) + SuspBlock(SELL<EMA200) | SL=0.50 TP=1.50 | RR 1:3]',
         initial_capital=100.0,
         sl_pts=0.50,
-        tp_pts=3.00,
+        tp_pts=1.50,
         cooldown_bars=1,
         max_daily_trades=9,
-        strategy_list=[FVGScalpStrategy(), OrderBlockStrategy(), LiquiditySweepFVGStrategy()],
+        strategy_list=BEST_STRATS,
         daily_ema200=daily_ema200_series,
     )
 
     # ── 15m last 60 days ──
-    # FVG_SCALP is primary — OB/LS as supplementary (only fire when FVG silent)
-    os.environ['ADX_MIN']      = '20'
-    os.environ['SELL_ENABLED'] = '1'
-    print("📊 Running 15m backtest (last 60 days — max yfinance supports for 15m)…\n")
-    df_15m    = fetch('15m', period='60d')
-
-    # 15m A: FVG-only (headline result — cleanest signal)
+    print("📊 Running 15m backtest (last 60 days)…\n")
+    df_15m = fetch('15m', period='60d')
     trades_15 = run(
         df_15m.copy(),
-        label='15M-A  |  last 60 days  [FVG_SCALP only | Volume+Session | Daily EMA200]',
+        label='15M  |  last 60 days  [V13 BEST: LS_FVG+OB+FVG(BUY>EMA200) + SuspBlock(SELL<EMA200) | SL=0.30 TP=0.90]',
         initial_capital=100.0,
         sl_pts=0.30,
-        tp_pts=1.80,
+        tp_pts=0.90,
         cooldown_bars=1,
         max_daily_trades=9,
-        strategy_list=[FVGScalpStrategy()],
-        daily_ema200=daily_ema200_series,
-    )
-
-    # 15m B: All 3 strategies (supplementary — OB/LS fire when FVG is silent)
-    trades_15b = run(
-        df_15m.copy(),
-        label='15M-B  |  last 60 days  [FVG+OB+LS | Volume+Session | Daily EMA200]',
-        initial_capital=100.0,
-        sl_pts=0.30,
-        tp_pts=1.80,
-        cooldown_bars=1,
-        max_daily_trades=9,
-        strategy_list=[FVGScalpStrategy(), OrderBlockStrategy(), LiquiditySweepFVGStrategy()],
+        strategy_list=[s.__class__() for s in BEST_STRATS],
         daily_ema200=daily_ema200_series,
     )
 
@@ -507,23 +523,15 @@ if __name__ == '__main__':
     if not trades_15.empty:
         trades_15.to_csv('backtest_15m_trades.csv', index=False)
         print(f"\n📝 15m trade log → backtest_15m_trades.csv  ({len(trades_15)} trades)")
-        print("\n─── ALL 15M TRADES ─────────────────────────────────────────────────────────")
-        print(trades_15[cols].to_string(index=False))
 
-    # ── Projection: when does $500/week become achievable? ──
-    if not trades_15.empty:
-        n15   = len(trades_15)
-        days15 = trades_15['date'].nunique()
-        weeks15 = max(days15 / 5, 1)
-        tpw_15m = n15 / weeks15                      # trades/week on 15m
-        tpw_5m  = tpw_15m * 3.0                      # ~3× denser on live 5m
-        ev_per  = trades_15['pnl'].sum() / n15 / (trades_15['lot'].iloc[0] / 0.01)
-
-        print(f"\n📈 15m observed: {tpw_15m:.1f} trades/week  |  EV/trade @ 0.01 lot: ${ev_per:.2f}")
-        print(f"   Live 5m estimate: ~{tpw_5m:.1f} trades/week (3× denser candles)")
-
-        print("\n── Conservative (15m rate, observed EV) ──")
-        project_to_500_per_week(ev_per, tpw_15m)
-
-        print("\n── Live bot estimate (5m rate, same EV) ──")
-        project_to_500_per_week(ev_per, tpw_5m)
+    # ── Projection ──
+    ref = trades_1h if not trades_1h.empty else trades_15
+    if not ref.empty:
+        n_ref   = len(ref)
+        days_ref = ref['date'].nunique()
+        weeks_ref = max(days_ref / 5, 1)
+        tpw = n_ref / weeks_ref
+        ev_per = ref['pnl'].sum() / n_ref / max(ref['lot'].iloc[0] / 0.01, 1)
+        print(f"\n📈 Observed: {tpw:.1f} trades/week  |  EV/trade @ 0.01 lot: ${ev_per:.2f}")
+        print("\n── Live 5m estimate (3× denser) ──")
+        project_to_500_per_week(ev_per, tpw * 3)
