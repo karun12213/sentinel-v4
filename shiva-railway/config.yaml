@@ -1,37 +1,126 @@
-# SHIVA — Central Configuration
-# All thresholds are loaded at startup; change here, not in code.
+# SHIVA V13 — Central Configuration
+# Updated from ICT 2023–2026 transcripts (103 files across 4 directories)
 
 # ── Phase 1: HTF Bias Engine ──────────────────────────────────────────────
 htf_bias:
-  ema_fast: 50          # EMA fast period (Daily / H4)
-  ema_slow: 200         # EMA slow period (Daily)
-  h4_ema_slow: 50       # H4 uses EMA50 as its slow line
-  structure_lookback: 10  # bars to scan for HH/HL (swing structure)
-  weekly_open_buffer: 0.0 # pts buffer around weekly open (0 = exact cross)
-  refresh_interval_mins: 60  # re-fetch HTF data every N minutes
-  # Score weights (must sum to 100)
-  weight_ema_cross: 40       # Daily EMA50/200 cross
-  weight_structure: 35       # HH/HL or LH/LL market structure
-  weight_weekly_open: 25     # price above/below weekly open
-  # Thresholds
-  bullish_threshold: 60   # score >= this → BULLISH
-  bearish_threshold: -60  # score <= this → BEARISH
-  # Between -60 and +60 → NEUTRAL (no trade bias override, normal filters apply)
+  ema_fast: 50
+  ema_slow: 200
+  h4_ema_slow: 50
+  structure_lookback: 10
+  weekly_open_buffer: 0.0
+  refresh_interval_mins: 60
+  weight_ema_cross: 40
+  weight_structure: 35
+  weight_weekly_open: 25
+  bullish_threshold: 60
+  bearish_threshold: -60
 
-# ── Phase 2: Kill Zone Time Filter ───────────────────────────────────────
+# ── Phase 2: Kill Zone Time Filter (ICT-precise windows, EST) ─────────────
 kill_zones:
-  london_open:  { start: "02:00", end: "05:00", tz: "US/Eastern" }
-  new_york_open: { start: "07:00", end: "10:00", tz: "US/Eastern" }
-  london_close: { start: "11:00", end: "12:00", tz: "US/Eastern", enabled: false }
-  avoid_monday: true
-  avoid_friday_after: "12:00"  # EST — avoid Friday afternoon
+  asian:       { start: "19:00", end: "21:00", tz: "US/Eastern" }          # sweet spot
+  asian_full:  { start: "19:00", end: "05:00", tz: "US/Eastern" }          # full range
+  london:      { start: "02:00", end: "04:00", tz: "US/Eastern" }          # sweet spot
+  london_full: { start: "02:00", end: "05:00", tz: "US/Eastern" }
+  premarket:   { start: "07:00", end: "09:30", tz: "US/Eastern" }          # FVG setup window
+  new_york_open: { start: "09:30", end: "10:00", tz: "US/Eastern" }        # 1st 30min highest prob
+  new_york_am:   { start: "09:30", end: "10:30", tz: "US/Eastern" }        # 1st hour dealing range
+  ny_lunch:      { start: "12:00", end: "13:30", tz: "US/Eastern" }        # carry-forward FVG window
+  pm_open:       { start: "13:30", end: "14:00", tz: "US/Eastern" }        # PM session open
+  macro_2pm:     { start: "14:00", end: "14:30", tz: "US/Eastern" }        # 2PM macro inversion
+  pm_sweet:      { start: "15:00", end: "15:45", tz: "US/Eastern" }        # PM sweet spot
+  market_close:  { start: "15:15", end: "15:45", tz: "US/Eastern" }        # MOC run
+  london_close:  { start: "11:00", end: "12:00", tz: "US/Eastern", enabled: false }
+  avoid_monday_open: true       # skip first 30min Monday (range establishment only)
+  avoid_friday_after: "12:00"   # Friday TGIF — switch to fade mode only
+
+# ── AMD Cycle (Accumulation → Manipulation → Distribution) ───────────────
+amd_cycle:
+  accumulation_session: "asian"           # no directional entries during accumulation
+  manipulation_session: "london"          # Judas entries; sweep opposite, then reverse
+  distribution_session: "new_york_am"     # trend follow entries; ride the delivery
+  # Intraday AMD:
+  # 09:30–10:00 = often Manipulation (Judas spike) — wait for reversal
+  # 10:00–12:00 = Distribution (trend follow)
+  # 12:00–13:30 = Re-accumulation (lunch, no directional entries)
+  # 13:30–16:00 = Second Distribution or PM Reversal
+  block_entries_in_accumulation: true     # skip entries during Asian accumulation phase
+
+# ── Day of Week Rules ─────────────────────────────────────────────────────
+dow_rules:
+  # Weekly high/low formation probabilities (ICT transcript data)
+  weekly_high_by_tuesday: true            # bearish week: high forms by Tuesday London
+  weekly_low_by_tuesday: true             # bullish week: low forms by Monday–Tuesday
+  highest_prob_day: "tuesday"             # highest probability for weekly extreme formation
+  wednesday_close_positions: true         # Wednesday after NY = typical position closure
+  friday_fade_enabled: true              # TGIF: fade 20–40% of weekly range on Friday PM
+  friday_fade_min_pct: 0.20              # minimum retracement of weekly range
+  friday_fade_max_pct: 0.40              # maximum retracement of weekly range
+  monday_range_bar: true                 # Monday sets range; large Monday candles don't reverse
+
+# ── Asian Range Tracker ───────────────────────────────────────────────────
+asian_range:
+  session_start_est: "19:00"
+  session_end_est:   "05:00"
+  judas_buffer_pct: 0.001                # 0.1% buffer above/below Asian range for sweep detection
+  # When London breaches Asian range → Judas signal for NY session
+  # London sweeps Asian high → expect NY to run SSL below Asian low
+  # London sweeps Asian low  → expect NY to run BSL above Asian high
+
+# ── Event Horizon ─────────────────────────────────────────────────────────
+event_horizon:
+  enabled: true
+  lookback_bars: 50                       # bars to scan for BSL/SSL pools
+  swing_bars: 5                           # bars for swing high/low detection
+  # Event Horizon = 50% midpoint between identified BSL and SSL
+  # If price is AT event horizon → neutral bias; do not enter
+  neutral_band_pct: 0.002                 # ±0.2% of price around EH = neutral zone
+
+# ── OTE Entry (Optimal Trade Entry — Fibonacci 62–79%) ───────────────────
+ote:
+  enabled: true
+  fib_low:  0.62                          # OTE entry zone low (62% retracement)
+  fib_high: 0.79                          # OTE entry zone high (79% retracement)
+  sweet_spot: 0.705                       # ideal entry at 70.5% retracement
+  tp_extension_1: 1.27                    # TP1 at 127% extension
+  tp_extension_2: 1.62                    # TP2 at 162% extension
+  tp_extension_3: 2.00                    # TP3 at 200% extension
+  swing_lookback: 30                      # bars to find anchor swing
+  max_age_bars: 20                        # OTE zone expires after 20 bars
+
+# ── PD Array Age Decay ────────────────────────────────────────────────────
+pd_array_age:
+  fresh_max_bars: 20                      # 0–20 bars: highest sensitivity, weight=1.0
+  medium_max_bars: 40                     # 21–40 bars: medium sensitivity, weight=0.7
+  stale_max_bars: 60                      # 41–60 bars: lower sensitivity, weight=0.4
+  expired_weight: 0.1                     # >60 bars: very low weight (still viable on HTF)
+  # FVG age should match these thresholds for zone scoring
+
+# ── NY Lunch Carry-Forward FVG ────────────────────────────────────────────
+lunch_fvg:
+  enabled: true
+  lunch_start_est: "12:00"
+  lunch_end_est:   "13:30"
+  # After BSL/SSL is taken during lunch → FVG formed immediately BEFORE that sweep
+  # is stored and used as high-probability reversal entry the NEXT DAY
+  carry_fvg_expiry_bars: 100              # carried FVG expires after 100 bars (~8 hours on 5m)
+
+# ── Suspension Block ──────────────────────────────────────────────────────
+suspension_block:
+  enabled: true
+  # Last up-close candle before a premium resistance (ATH, rejection block, old high)
+  # = suspension block → short entry
+  # Exit if any candle BODY closes above CE of premium wick
+  lookback_bars: 20                       # scan last N bars for suspension block
+  min_premium_distance_atr: 1.5          # resistance must be ≥ 1.5 ATR above swing high
 
 # ── Phase 3: News Avoidance ───────────────────────────────────────────────
 news_filter:
-  block_before_mins: 45    # block entries N minutes before high-impact event
-  block_after_mins: 30     # block entries N minutes after high-impact event
-  tighten_stops_pct: 0.50  # tighten existing SL to 50% during live news
+  block_before_mins: 45
+  block_after_mins: 30
+  tighten_stops_pct: 0.50
   refresh_interval_hours: 4
+  # NFP week: only trade Mon–Wed; avoid Thu–Fri
+  nfp_avoid_thursday_friday: true
   high_impact_keywords:
     - "Crude Oil Inventories"
     - "EIA"
@@ -41,12 +130,14 @@ news_filter:
     - "FOMC"
     - "Fed Chair"
     - "Federal Funds Rate"
+    - "CPI"
+    - "PPI"
+    - "PCE"
 
 # ── Phase 4: Confluence Scoring ───────────────────────────────────────────
 confluence:
-  full_entry_threshold: 90     # >= full position (1% risk)
-  half_entry_threshold: 70     # 70-89 = half position (0.5% risk)
-  # no-trade below 70
+  full_entry_threshold: 90
+  half_entry_threshold: 70
   scores:
     htf_bias_aligned: 25
     kill_zone_active: 15
@@ -55,48 +146,70 @@ confluence:
     fvg_present: 15
     cnn_confidence: 20
     rsi_div_or_ob: 10
+    amd_distribution_phase: 10           # +10 if in AMD distribution phase
+    judas_confirmed: 15                  # +15 if Judas sweep confirmed
+    ote_zone: 10                         # +10 if price in OTE 62–79% zone
+    dow_high_prob: 10                    # +10 if Tuesday (highest probability day)
 
 # ── Phase 5: Market Regime ────────────────────────────────────────────────
 regime:
-  adx_trend_threshold: 25      # ADX > 25 → trending
-  adx_range_threshold: 20      # ADX < 20 → ranging
-  atr_percentile_hv: 90        # ATR > 90th pct → high volatility
+  adx_trend_threshold: 25
+  adx_range_threshold: 20
+  atr_percentile_hv: 90
   atr_lookback: 20
-  ema_slope_lookback: 5        # bars for EMA slope calculation
-  hv_size_reduction: 0.50      # reduce position 50% in HIGH_VOLATILITY
-  bb_width_narrow_pct: 0.02    # BB width < 2% of price → narrow (ranging)
+  ema_slope_lookback: 5
+  hv_size_reduction: 0.50
+  bb_width_narrow_pct: 0.02
+  # LRLRC / HRLRC classifier (from ICT transcripts)
+  # LRLRC: big directional candles, small retracement, FVGs stay open → trend aggressively
+  # HRLRC: inside days, overlapping ranges, FVGs fill quickly → reduce / avoid
+  inside_day_lookback: 5                 # bars to check for consecutive inside days
+  inside_day_body_only: true             # use body-only inside day (ICT rule, not wick-based)
+  lrlrc_min_candle_ratio: 2.0            # directional candle must be 2× size of retracement candle
+  hrlrc_max_inside_days: 3              # 3+ consecutive inside days = HRLRC, reduce size
 
 # ── Phase 6: CNN Ensemble ─────────────────────────────────────────────────
 cnn:
-  enabled: false               # enable when CNN server is live
+  enabled: false
   base_url: "http://localhost:5000"
-  min_confidence: 0.65         # skip if ensemble confidence < 65%
+  min_confidence: 0.65
   window_size: 60
   n_features: 24
 
 # ── Phase 7: Judas Swing ─────────────────────────────────────────────────
 judas_swing:
-  session_lookback_mins: 15    # measure initial direction in first 15 min
-  sweep_window_mins: 30        # watch for sweep in first 30 min
-  displacement_min_atr: 0.8   # displacement candle must be >= 0.8x ATR
+  session_lookback_mins: 15
+  sweep_window_mins: 30
+  displacement_min_atr: 0.8
   fvg_max_age_bars: 5
+  # London Judas: 02:00–05:00 EST — sweeps Asian range, then reverses
+  # NY Judas:     09:30–10:30 EST — sweeps overnight high/low, then reverses
+  # Invalid if: price closes BODY above Judas high on 15m candle (for short)
+  invalidation_body_close: true          # abort if 15m body closes beyond Judas extreme
 
 # ── Phase 8: Dynamic Stop Loss ───────────────────────────────────────────
 dynamic_sl:
-  min_atr_mult: 1.5            # SL must be >= 1.5x ATR from entry
-  max_atr_mult: 3.0            # SL wider than 3x ATR → skip trade
-  breakeven_at_rr: 1.0         # move to breakeven after 1:1 RR
-  partial_exit_pct: 0.50       # close 50% at 1:1
-  tp_fib: -0.27                # Fib extension TP for remaining 50%
+  min_atr_mult: 1.5
+  max_atr_mult: 3.0
+  breakeven_at_rr: 1.0
+  partial_exit_pct: 0.50
+  tp_fib: -0.27
+  # CE (Consequent Encroachment) = 50% of any FVG/range = first partial TP
+  ce_partial_exit: true                  # take 50% off at CE of entry FVG
+  trail_by_structure: true              # trail stop to previous STH/STL after CE hit
 
 # ── Phase 9: Circuit Breaker ─────────────────────────────────────────────
 circuit_breaker:
-  max_daily_losses: 2          # pause after N losses in one day
-  max_daily_drawdown_pct: 2.0  # full shutdown if daily DD > 2%
-  max_daily_trades: 20         # max per day (backtest: 6-17 signals/day on 5m)
-  wr_review_window: 20         # rolling N-trade window
-  wr_alert_threshold: 0.50     # alert + reduce size if WR < 50%
+  max_daily_losses: 2
+  max_daily_drawdown_pct: 2.0
+  max_daily_trades: 20
+  wr_review_window: 20
+  wr_alert_threshold: 0.50
   size_reduction_on_alert: 0.50
+  # After AM session stop-out: wait for PM session; do NOT re-enter AM
+  am_stopout_wait_for_pm: true
+  # Reversal rule: NEVER reverse a position; exit and wait
+  no_position_reversal: true
 
 # ── Phase 10: Walk-Forward Backtesting ────────────────────────────────────
 backtest:
@@ -112,4 +225,4 @@ performance:
   csv_export_path: "/tmp/shiva_trades"
   rolling_wr_window: 20
   wr_alert_threshold: 0.55
-  daily_summary_hour_utc: 22   # print daily summary at 22:00 UTC
+  daily_summary_hour_utc: 22

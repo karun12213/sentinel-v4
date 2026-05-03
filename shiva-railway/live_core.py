@@ -1,16 +1,11 @@
 """
-SHIVA V6 — IFVG + FVG Scalp | Fixed SL/TP | Dynamic Lot | Max 9 trades/day
-Entry: Fresh FVG zone retests + EMA20 bounce
-SL: Fixed 0.30pt ($3 at 0.01 lot)  TP: Fixed 1.80pt ($18 at 0.01 lot)  RR: 1:6
-Lot scaling every $100 of balance (aggressive compounding toward $500/week):
-  $100-$199 → 0.01 lot  ($3 SL  / $18 TP)
-  $200-$299 → 0.02 lot  ($6 SL  / $36 TP)
-  $300-$399 → 0.03 lot  ($9 SL  / $54 TP)
-  $1000+    → 0.10 lot  ($30 SL / $180 TP)
-  $3000+    → 0.30 lot  ($90 SL / $540 TP) ← ~$500/week target
-  Max: 1.00 lot
-Circuit breaker: 3 consecutive losses in a day → pause until next day
-Daily limit: MAX_DAILY_TRADES (default 9)
+SHIVA V13 — ICT SMC Full Stack | AMD Cycle | Asian Judas | OTE | Suspension Block
+Updated from 103 ICT transcripts (2023–2026 Mentorship + W.E.N.T. + Scout Sniper).
+
+Entry models: FVG_SCALP, OB_SMC, LS_FVG, JUDAS_SWING, OTE (62-79% Fib), SUSPENSION_BLOCK, ASIAN_JUDAS
+New filters:  AMD session gate, DOW rules, TGIF Friday fade, Event Horizon, Asian range Judas
+New concepts: CE partial exit (50% of FVG), NY lunch carry-forward FVG, PD array age decay
+Kill zones:   Asian 7PM-9PM, London 2AM-4AM, NY Open 9:30-10:30AM, 2PM macro, PM sweet 3PM-3:45PM
 """
 import asyncio
 import json
@@ -471,8 +466,8 @@ class IFVGStrategy(BaseStrategy):
                 candidates.append(z)
             if candidates:
                 z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
-                print(f"  🔵 IFVG BUY  [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Discount  RSI={rsi:.0f}")
-                return 1, z['low']
+                print(f"  🔵 IFVG BUY  [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Discount  RSI={rsi:.0f}  wick_SL={low:.3f}")
+                return 1, low
 
         if in_premium and downtrend and 45 <= rsi <= 80:
             candidates = []
@@ -489,8 +484,8 @@ class IFVGStrategy(BaseStrategy):
                 candidates.append(z)
             if candidates:
                 z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
-                print(f"  🔴 IFVG SELL [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Premium   RSI={rsi:.0f}")
-                return -1, z['high']
+                print(f"  🔴 IFVG SELL [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Premium   RSI={rsi:.0f}  wick_SL={high:.3f}")
+                return -1, high
 
         return 0, 0.0
 
@@ -545,11 +540,6 @@ class FVGScalpStrategy(BaseStrategy):
         uptrend   = close > ema200
         downtrend = close < ema200
 
-        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
-        adx_min = float(os.getenv('ADX_MIN', '25'))   # V12: raised to 25 for quality filter
-        if atr > sl_pts * 1.5:           return 0, 0.0  # too volatile
-        if adx > 0 and adx < adx_min:   return 0, 0.0  # no trend
-
         # Session filter: skip weekend open gap / Sunday gaps only
         try:
             bar_dt  = df.index[-1]
@@ -571,8 +561,8 @@ class FVGScalpStrategy(BaseStrategy):
         ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
         bar_mid     = (high + low) / 2.0
 
-        # BUY: FVG retest in uptrend, EMA20+EMA50 rising, RSI 55–68 (quality zone)
-        if uptrend and 55 <= rsi <= 68 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
+        # BUY: FVG retest in uptrend, RSI not overbought
+        if uptrend and 30 <= rsi <= 75 and close >= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bull':        continue
                 age = n - 1 - fvg['idx']
@@ -581,14 +571,14 @@ class FVGScalpStrategy(BaseStrategy):
                 if low  > fvg['high']:           continue
                 if close < fvg['low']:           continue
                 if close < open_:               continue
-                print(f"  🟢 FVG SCALP BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
-                return 1, fvg['low']
+                print(f"  🟢 FVG SCALP BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={low:.3f}")
+                return 1, low
 
         if os.getenv('SELL_ENABLED', '1') == '0':
             return 0, 0.0
 
-        # SELL: bearish FVG retest, downtrend, EMA20+EMA50 both falling, RSI 32–45 (quality zone)
-        if downtrend and 32 <= rsi <= 45 and ema20_slope < 0 and ema50_slope <= 0 and close <= bar_mid:
+        # SELL: bearish FVG retest in downtrend, RSI not oversold
+        if downtrend and 25 <= rsi <= 70 and close <= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bear':        continue
                 age = n - 1 - fvg['idx']
@@ -597,8 +587,8 @@ class FVGScalpStrategy(BaseStrategy):
                 if high < fvg['low']:            continue  # didn't reach zone
                 if close > fvg['high']:          continue  # broke through zone — skip
                 if close > open_:               continue  # need bearish close
-                print(f"  🔴 FVG SCALP SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
-                return -1, fvg['high']
+                print(f"  🔴 FVG SCALP SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={high:.3f}")
+                return -1, high
 
         return 0, 0.0
 
@@ -638,22 +628,15 @@ class EMABounceStrategy(BaseStrategy):
         prev_close = float(prev['close'])
         prev_ema20 = float(prev.get('EMA_20', prev_close) or prev_close)
 
-        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
-        adx_min = float(os.getenv('ADX_MIN', '20'))
-        if atr > sl_pts * 1.5:           return 0, 0.0
-        if adx > 0 and adx < adx_min:   return 0, 0.0
-
         bar_mid   = (high + low) / 2.0
         uptrend   = close > ema200
         downtrend = close < ema200
         ema20_slope = ema20 - prev_ema20
         ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
 
-        # BUY: EMA20 bounce in uptrend, EMA20+EMA50 rising, RSI 35–68
+        # BUY: EMA20 bounce in uptrend
         if (uptrend and
-                35 < rsi < 65 and
-                ema20_slope > 0 and
-                ema50_slope >= 0 and
+                30 < rsi < 75 and
                 prev_close < prev_ema20 and
                 close > ema20 and
                 close > open_ and
@@ -665,11 +648,9 @@ class EMABounceStrategy(BaseStrategy):
         if os.getenv('SELL_ENABLED', '1') == '0':
             return 0, 0.0
 
-        # SELL: EMA20 rejection in downtrend, EMA20+EMA50 both falling, RSI 50–75
+        # SELL: EMA20 rejection in downtrend
         if (downtrend and
-                50 < rsi < 75 and
-                ema20_slope < 0 and
-                ema50_slope <= 0 and
+                25 < rsi < 80 and
                 prev_close > prev_ema20 and
                 close < ema20 and
                 close < open_ and
@@ -740,19 +721,6 @@ class OrderBlockStrategy(BaseStrategy):
 
         if atr == 0: return 0, 0.0
 
-        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
-        adx_min = float(os.getenv('ADX_MIN',   '20'))
-        if atr > sl_pts * 1.5:         return 0, 0.0
-        if adx > 0 and adx < adx_min: return 0, 0.0
-
-        # Session filter: OBs are most reliable during London+NY active hours
-        try:
-            bh = df.index[-1].hour if hasattr(df.index[-1], 'hour') else None
-            if bh is not None and not (7 <= bh < 20):
-                return 0, 0.0
-        except Exception:
-            pass
-
         # Volume confirmation — OBs require meaningful participation
         try:
             vol_sma = float(r.get('VOL_SMA20', 0) or 0)
@@ -774,7 +742,7 @@ class OrderBlockStrategy(BaseStrategy):
         obs  = self._find_obs(bars, atr)
 
         # BUY: bullish OB retest — price touches OB, closes bullishly above midpoint
-        if uptrend and 35 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0:
+        if uptrend and 30 < rsi < 75:
             for ob in reversed(obs):
                 if ob['type'] != 'bull': continue
                 age = n - 1 - ob['idx']
@@ -783,14 +751,14 @@ class OrderBlockStrategy(BaseStrategy):
                 if close < ob['low']:  continue   # pierced through — zone failed
                 if close < open_:      continue   # bearish close inside OB = bad
                 if close < bar_mid:    continue   # close in lower half = weak
-                print(f"  🟦 OB BUY   [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
-                return 1, ob['low']
+                print(f"  🟦 OB BUY   [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={low:.3f}")
+                return 1, low
 
         if os.getenv('SELL_ENABLED', '1') == '0':
             return 0, 0.0
 
         # SELL: bearish OB retest
-        if downtrend and 50 < rsi < 75 and ema20_slope < 0 and ema50_slope <= 0:
+        if downtrend and 25 < rsi < 80:
             for ob in reversed(obs):
                 if ob['type'] != 'bear': continue
                 age = n - 1 - ob['idx']
@@ -799,8 +767,8 @@ class OrderBlockStrategy(BaseStrategy):
                 if close > ob['high']: continue
                 if close > open_:      continue
                 if close > bar_mid:    continue
-                print(f"  🟧 OB SELL  [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}")
-                return -1, ob['high']
+                print(f"  🟧 OB SELL  [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={high:.3f}")
+                return -1, high
 
         return 0, 0.0
 
@@ -873,18 +841,6 @@ class LiquiditySweepFVGStrategy(BaseStrategy):
         adx    = float(r.get('ADX_14', 0) or 0)
 
         if atr == 0: return 0, 0.0
-        sl_pts  = float(os.getenv('SL_POINTS', '0.30'))
-        adx_min = float(os.getenv('ADX_MIN', '20'))
-        if atr > sl_pts * 1.8:         return 0, 0.0  # slightly wider — LS setups happen in volatile bars
-        if adx > 0 and adx < adx_min: return 0, 0.0
-
-        # Session filter
-        try:
-            bh = df.index[-1].hour if hasattr(df.index[-1], 'hour') else None
-            if bh is not None and not (7 <= bh < 17):
-                return 0, 0.0
-        except Exception:
-            pass
 
         uptrend   = close > ema200
         downtrend = close < ema200
@@ -898,7 +854,7 @@ class LiquiditySweepFVGStrategy(BaseStrategy):
         fvgs = self._find_fvgs(bars)
 
         # BUY: sweep below swing low → bullish FVG retested
-        if uptrend and 30 < rsi < 65 and ema20_slope > 0 and ema50_slope >= 0 and close >= bar_mid:
+        if uptrend and 30 < rsi < 75 and close >= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bull': continue
                 age = n - 1 - fvg['idx']
@@ -907,14 +863,14 @@ class LiquiditySweepFVGStrategy(BaseStrategy):
                 if close < fvg['low']:  continue
                 if close < open_:       continue
                 if self._swept_liquidity(bars, fvg['idx']):
-                    print(f"  🟢 LS+FVG BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
-                    return 1, fvg['low']
+                    print(f"  🟢 LS+FVG BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  wick_SL={low:.3f}")
+                    return 1, low
 
         if os.getenv('SELL_ENABLED', '1') == '0':
             return 0, 0.0
 
         # SELL: sweep above swing high → bearish FVG retested
-        if downtrend and 45 < rsi < 75 and ema20_slope < 0 and ema50_slope <= 0 and close <= bar_mid:
+        if downtrend and 25 < rsi < 80 and close <= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bear': continue
                 age = n - 1 - fvg['idx']
@@ -923,9 +879,569 @@ class LiquiditySweepFVGStrategy(BaseStrategy):
                 if close > fvg['high']: continue
                 if close > open_:       continue
                 if self._swept_liquidity(bars, fvg['idx']):
-                    print(f"  🔴 LS+FVG SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}")
-                    return -1, fvg['high']
+                    print(f"  🔴 LS+FVG SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  wick_SL={high:.3f}")
+                    return -1, high
 
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
+# ICT SESSION FILTER (AMD cycle + DOW rules + TGIF + kill zones)
+# ─────────────────────────────────────────────
+import pytz
+
+class ICTSessionFilter:
+    """
+    Implements ICT's time-based rules from transcripts:
+    - AMD cycle: Asian=Accumulation(no trade), London=Manipulation(Judas), NY=Distribution
+    - DOW rules: Tuesday highest prob; Friday TGIF fade
+    - Kill zone exact windows (EST)
+    - 2PM macro inversion window
+    """
+    EST = pytz.timezone('US/Eastern')
+
+    def check(self) -> dict:
+        now_est = datetime.now(self.EST)
+        hour    = now_est.hour
+        minute  = now_est.minute
+        dow     = now_est.weekday()   # 0=Mon … 4=Fri
+        t       = hour * 60 + minute  # minutes since midnight EST
+
+        result = {
+            'allowed':        True,
+            'phase':          'DISTRIBUTION',
+            'kill_zone':      None,
+            'reason':         '',
+            'friday_fade':    False,
+            'is_tuesday':     dow == 1,
+            'dow':            ['Mon','Tue','Wed','Thu','Fri'][dow] if dow < 5 else 'Weekend',
+        }
+
+        # Weekend: no trading
+        if dow >= 5:
+            result['allowed'] = False
+            result['reason']  = 'Weekend'
+            return result
+
+        # Monday: skip first 30 min (range establishment)
+        if dow == 0 and t < 570:     # before 9:30AM
+            result['reason'] = 'Monday opening range establishment'
+
+        # Friday TGIF: after 12PM → fade mode only (no fresh breakout longs at weekly high)
+        if dow == 4 and t >= 720:    # Friday after 12PM
+            result['friday_fade'] = True
+            result['reason']      = 'Friday TGIF fade mode'
+
+        # AMD phase assignment
+        if   300 <= t < 540:          # 5AM–9AM  → London distribution / pre-market
+            result['phase']      = 'DISTRIBUTION'
+            result['kill_zone']  = 'LONDON'
+        elif 120 <= t < 300:          # 2AM–5AM  → London manipulation (Judas)
+            result['phase']      = 'MANIPULATION'
+            result['kill_zone']  = 'LONDON_JUDAS'
+        elif t < 120 or t >= 1140:    # before 2AM or after 7PM → Asian accumulation
+            result['phase']      = 'ACCUMULATION'
+            result['kill_zone']  = 'ASIAN'
+        elif 570 <= t < 630:          # 9:30–10:30AM → NY open (often Judas spike first)
+            result['phase']      = 'MANIPULATION'
+            result['kill_zone']  = 'NY_OPEN'
+        elif 630 <= t < 720:          # 10:30AM–12PM → NY distribution
+            result['phase']      = 'DISTRIBUTION'
+            result['kill_zone']  = 'NY_AM'
+        elif 720 <= t < 810:          # 12PM–1:30PM → lunch re-accumulation
+            result['phase']      = 'ACCUMULATION'
+            result['kill_zone']  = 'NY_LUNCH'
+        elif 810 <= t < 840:          # 1:30PM–2PM → PM open
+            result['phase']      = 'DISTRIBUTION'
+            result['kill_zone']  = 'PM_OPEN'
+        elif 840 <= t < 870:          # 2PM–2:30PM → 2PM macro inversion
+            result['phase']      = 'DISTRIBUTION'
+            result['kill_zone']  = 'MACRO_2PM'
+        elif 900 <= t < 945:          # 3PM–3:45PM → PM sweet spot
+            result['phase']      = 'DISTRIBUTION'
+            result['kill_zone']  = 'PM_SWEET'
+        else:
+            result['phase']      = 'DISTRIBUTION'
+            result['kill_zone']  = 'NY_PM'
+
+        return result
+
+    def allows_entry(self, session_result: dict, signal_direction: int) -> tuple[bool, str]:
+        """Block entries during accumulation (Asian session). Allow Judas in manipulation."""
+        if not session_result['allowed']:
+            return False, session_result['reason']
+        phase = session_result['phase']
+        kz    = session_result['kill_zone']
+        # Block directional entries during Asian accumulation
+        if phase == 'ACCUMULATION' and kz == 'ASIAN':
+            return False, 'Asian accumulation phase — no directional entries'
+        # Block directional entries during lunch re-accumulation
+        if phase == 'ACCUMULATION' and kz == 'NY_LUNCH':
+            return False, 'NY lunch re-accumulation — carry-forward FVG only'
+        return True, kz or 'OK'
+
+
+# ─────────────────────────────────────────────
+# ASIAN RANGE JUDAS STRATEGY
+# ─────────────────────────────────────────────
+class AsianRangeJudasStrategy(BaseStrategy):
+    """
+    ICT Asian Range + Judas model:
+    1. Mark Asian session H/L (7PM–5AM EST)
+    2. London session sweeps one side (Judas = fake move)
+    3. NY session trades OPPOSITE to the London Judas sweep
+    Entry: First FVG after CHoCH following the London sweep
+    Stop:  Beyond Judas extreme
+    Target: Opposite Asian range extreme (SSL or BSL)
+    """
+    EST = pytz.timezone('US/Eastern')
+
+    def __init__(self):
+        super().__init__("ASIAN_JUDAS")
+        self._asian_high: float = 0.0
+        self._asian_low:  float = 0.0
+        self._asian_date: object = None
+        self._judas_direction: int = 0   # +1=London swept high → NY short; -1=swept low → NY long
+        self._judas_extreme: float = 0.0
+
+    def _update_asian_range(self, df: pd.DataFrame):
+        """Compute Asian session H/L from available 5m data."""
+        try:
+            idx = df.index
+            if not isinstance(idx, pd.DatetimeIndex):
+                return
+            if getattr(idx, 'tz', None) is None:
+                idx = idx.tz_localize('UTC')
+            est_idx = idx.tz_convert(self.EST)
+            today   = est_idx[-1].date()
+            if self._asian_date == today:
+                return
+            # Asian = 7PM prior day to 5AM today (EST)
+            asian_mask = (
+                ((est_idx.hour >= 19) & (est_idx.date() == today - timedelta(days=1))) |
+                ((est_idx.hour < 5)   & (est_idx.date() == today))
+            )
+            asian_df = df[asian_mask]
+            if len(asian_df) >= 5:
+                self._asian_high = float(asian_df['high'].max())
+                self._asian_low  = float(asian_df['low'].min())
+                self._asian_date = today
+                # Check if London (2AM–5AM) swept Asian range
+                london_mask = (est_idx.hour >= 2) & (est_idx.hour < 5) & (est_idx.date() == today)
+                london_df = df[london_mask]
+                if not london_df.empty:
+                    buf = (self._asian_high - self._asian_low) * 0.001
+                    if float(london_df['high'].max()) > self._asian_high + buf:
+                        self._judas_direction = -1  # London swept highs → NY goes SHORT (SSL target)
+                        self._judas_extreme   = float(london_df['high'].max())
+                    elif float(london_df['low'].min()) < self._asian_low - buf:
+                        self._judas_direction = 1   # London swept lows → NY goes LONG (BSL target)
+                        self._judas_extreme   = float(london_df['low'].min())
+                    else:
+                        self._judas_direction = 0
+        except Exception:
+            pass
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < 80:
+            return 0, 0.0
+
+        self._update_asian_range(df)
+
+        if self._judas_direction == 0 or self._asian_high == 0:
+            return 0, 0.0
+
+        # Only fire during NY session (9:30AM–12PM EST)
+        try:
+            now_est = df.index[-1].tz_convert(self.EST)
+            t = now_est.hour * 60 + now_est.minute
+            if not (570 <= t <= 720):
+                return 0, 0.0
+        except Exception:
+            return 0, 0.0
+
+        r      = df.iloc[-1]
+        close  = float(r['close'])
+        open_  = float(r['open'])
+        high   = float(r['high'])
+        low    = float(r['low'])
+        ema200 = float(r.get('EMA_200', close) or close)
+        rsi    = float(r.get('RSI', 50) or 50)
+        atr    = float(r.get('ATR', 0) or 0)
+        if atr == 0:
+            return 0, 0.0
+
+        # Find first FVG after London Judas sweep
+        bars = df.tail(40).reset_index(drop=True)
+        n    = len(bars)
+        fvgs = []
+        for i in range(1, n - 1):
+            ph = float(bars.iloc[i - 1]['high'])
+            pl = float(bars.iloc[i - 1]['low'])
+            nh = float(bars.iloc[i + 1]['high'])
+            nl = float(bars.iloc[i + 1]['low'])
+            if ph < nl:
+                fvgs.append({'type': 'bull', 'low': ph, 'high': nl, 'idx': i})
+            if pl > nh:
+                fvgs.append({'type': 'bear', 'low': nh, 'high': pl, 'idx': i})
+
+        # Judas swept highs → NY SHORT: look for bearish FVG
+        if self._judas_direction == -1 and 25 <= rsi <= 75:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bear': continue
+                age = n - 1 - fvg['idx']
+                if age > 8 or age < 1:   continue
+                if high < fvg['low']:    continue
+                if close > fvg['high']:  continue
+                if close > open_:        continue
+                print(f"  🔴 ASIAN_JUDAS SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] Judas_high={self._judas_extreme:.3f} Asian_H={self._asian_high:.3f}")
+                return -1, high
+
+        # Judas swept lows → NY LONG: look for bullish FVG
+        if self._judas_direction == 1 and 25 <= rsi <= 75:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bull': continue
+                age = n - 1 - fvg['idx']
+                if age > 8 or age < 1:   continue
+                if low  > fvg['high']:   continue
+                if close < fvg['low']:   continue
+                if close < open_:        continue
+                print(f"  🟢 ASIAN_JUDAS BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] Judas_low={self._judas_extreme:.3f} Asian_L={self._asian_low:.3f}")
+                return 1, low
+
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
+# OTE STRATEGY (Optimal Trade Entry — 62–79% Fibonacci)
+# ─────────────────────────────────────────────
+class OTEStrategy(BaseStrategy):
+    """
+    ICT OTE: After a swing low-to-high (bullish), wait for 62–79% retracement.
+    Entry at 70.5% Fibonacci retracement (sweet spot).
+    SL: 1 tick below swing low (for long).
+    TP: 127% extension of the swing.
+    Only valid in Distribution phase (not Accumulation).
+    """
+    SWING_LOOKBACK = 30
+    OTE_LOW  = 0.62
+    OTE_HIGH = 0.79
+
+    def __init__(self):
+        super().__init__("OTE")
+
+    def _find_swing(self, bars: pd.DataFrame) -> tuple[float, float, int, int]:
+        """Find most recent significant swing low → high (for bullish OTE) or high → low."""
+        bars = bars.reset_index(drop=True)
+        n    = len(bars)
+        best_bull = None
+        best_bear = None
+        for i in range(3, n - 3):
+            # Swing low at i: lower than 3 bars on each side
+            if (float(bars.iloc[i]['low']) < float(bars.iloc[i-1]['low']) and
+                    float(bars.iloc[i]['low']) < float(bars.iloc[i-2]['low']) and
+                    float(bars.iloc[i]['low']) < float(bars.iloc[i+1]['low']) and
+                    float(bars.iloc[i]['low']) < float(bars.iloc[i+2]['low'])):
+                # Find subsequent swing high
+                for j in range(i + 3, min(i + self.SWING_LOOKBACK, n - 2)):
+                    if (float(bars.iloc[j]['high']) > float(bars.iloc[j-1]['high']) and
+                            float(bars.iloc[j]['high']) > float(bars.iloc[j+1]['high'])):
+                        swing_size = float(bars.iloc[j]['high']) - float(bars.iloc[i]['low'])
+                        if best_bull is None or swing_size > (best_bull[1] - best_bull[0]):
+                            best_bull = (float(bars.iloc[i]['low']), float(bars.iloc[j]['high']), i, j)
+                        break
+            # Swing high at i
+            if (float(bars.iloc[i]['high']) > float(bars.iloc[i-1]['high']) and
+                    float(bars.iloc[i]['high']) > float(bars.iloc[i-2]['high']) and
+                    float(bars.iloc[i]['high']) > float(bars.iloc[i+1]['high']) and
+                    float(bars.iloc[i]['high']) > float(bars.iloc[i+2]['high'])):
+                for j in range(i + 3, min(i + self.SWING_LOOKBACK, n - 2)):
+                    if (float(bars.iloc[j]['low']) < float(bars.iloc[j-1]['low']) and
+                            float(bars.iloc[j]['low']) < float(bars.iloc[j+1]['low'])):
+                        swing_size = float(bars.iloc[i]['high']) - float(bars.iloc[j]['low'])
+                        if best_bear is None or swing_size > (best_bear[0] - best_bear[1]):
+                            best_bear = (float(bars.iloc[i]['high']), float(bars.iloc[j]['low']), i, j)
+                        break
+        return best_bull, best_bear
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < 70:
+            return 0, 0.0
+
+        r      = df.iloc[-1]
+        close  = float(r['close'])
+        open_  = float(r['open'])
+        high   = float(r['high'])
+        low    = float(r['low'])
+        ema200 = float(r.get('EMA_200', close) or close)
+        rsi    = float(r.get('RSI', 50) or 50)
+        atr    = float(r.get('ATR', 0) or 0)
+        if atr == 0:
+            return 0, 0.0
+
+        uptrend   = close > ema200
+        downtrend = close < ema200
+        bars      = df.tail(self.SWING_LOOKBACK + 5)
+        bull_swing, bear_swing = self._find_swing(bars)
+
+        # Bullish OTE: swing L→H, price retraces 62–79%
+        if uptrend and bull_swing and 20 <= rsi <= 60:
+            swing_low, swing_high, _, swing_end_idx = bull_swing
+            n      = len(bars)
+            age    = n - 1 - swing_end_idx
+            if age <= 20:
+                swing_range = swing_high - swing_low
+                if swing_range > atr * 0.5:
+                    ote_low  = swing_high - swing_range * self.OTE_HIGH
+                    ote_high = swing_high - swing_range * self.OTE_LOW
+                    if ote_low <= close <= ote_high and close > open_:
+                        tp1 = swing_low + swing_range * 1.27
+                        print(f"  🟢 OTE BUY  [{ote_low:.3f}–{ote_high:.3f}] swing={swing_low:.3f}→{swing_high:.3f} TP1={tp1:.3f} RSI={rsi:.0f}")
+                        return 1, swing_low
+
+        # Bearish OTE: swing H→L, price retraces 62–79%
+        if downtrend and bear_swing and 40 <= rsi <= 80:
+            swing_high, swing_low, _, swing_end_idx = bear_swing
+            n      = len(bars)
+            age    = n - 1 - swing_end_idx
+            if age <= 20:
+                swing_range = swing_high - swing_low
+                if swing_range > atr * 0.5:
+                    ote_low  = swing_low + swing_range * self.OTE_LOW
+                    ote_high = swing_low + swing_range * self.OTE_HIGH
+                    if ote_low <= close <= ote_high and close < open_:
+                        tp1 = swing_high - swing_range * 1.27
+                        print(f"  🔴 OTE SELL [{ote_low:.3f}–{ote_high:.3f}] swing={swing_high:.3f}→{swing_low:.3f} TP1={tp1:.3f} RSI={rsi:.0f}")
+                        return -1, swing_high
+
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
+# SUSPENSION BLOCK STRATEGY (short at last up-close before premium resistance)
+# ─────────────────────────────────────────────
+class SuspensionBlockStrategy(BaseStrategy):
+    """
+    ICT Suspension Block: last up-close candle immediately before a premium
+    resistance level (ATH, rejection block, old high) = short entry.
+    Exit rule: if any BODY closes above CE of premium wick → abort.
+    Only valid in SELL direction (premium resistance reversal).
+    """
+    LOOKBACK = 30
+
+    def __init__(self):
+        super().__init__("SUSPENSION_BLOCK")
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < 70 or os.getenv('SELL_ENABLED', '1') == '0':
+            return 0, 0.0
+
+        r      = df.iloc[-1]
+        close  = float(r['close'])
+        open_  = float(r['open'])
+        high   = float(r['high'])
+        low    = float(r['low'])
+        ema200 = float(r.get('EMA_200', close) or close)
+        rsi    = float(r.get('RSI', 50) or 50)
+        atr    = float(r.get('ATR', 0) or 0)
+        if atr == 0:
+            return 0, 0.0
+
+        bars   = df.tail(self.LOOKBACK + 5).reset_index(drop=True)
+        n      = len(bars)
+
+        # Find the highest swing high in lookback (premium resistance)
+        swing_high = float(bars['high'].max())
+        sh_idx     = int(bars['high'].idxmax())
+
+        # Must be significantly above current price and within lookback
+        if swing_high < close + atr * 1.5:
+            return 0, 0.0
+        if n - 1 - sh_idx > self.LOOKBACK:
+            return 0, 0.0
+
+        # CE of the premium wick = 50% between swing high and bar close at that index
+        premium_bar = bars.iloc[sh_idx]
+        ce_premium  = (float(premium_bar['high']) + float(premium_bar['close'])) / 2.0
+
+        # Last up-close candle in the 5 bars BEFORE the swing high = suspension block
+        pre_high = bars.iloc[max(0, sh_idx - 6): sh_idx]
+        sus_block = None
+        for i in range(len(pre_high) - 1, -1, -1):
+            bar = pre_high.iloc[i]
+            if float(bar['close']) > float(bar['open']):
+                sus_block = bar
+                break
+
+        if sus_block is None:
+            return 0, 0.0
+
+        sb_low  = float(sus_block['low'])
+        sb_high = float(sus_block['high'])
+
+        # Current price must be trading INSIDE or just above the suspension block
+        if not (sb_low <= close <= sb_high + atr * 0.3):
+            return 0, 0.0
+
+        # Must be bearish candle or at least bearish close
+        if close > open_:
+            return 0, 0.0
+
+        # RSI filter: in premium territory, not oversold
+        if not (45 <= rsi <= 80):
+            return 0, 0.0
+
+        # Validity check: no body should have closed above CE of premium wick recently
+        recent = bars.iloc[sh_idx:]
+        for _, bar in recent.iterrows():
+            if max(float(bar['open']), float(bar['close'])) > ce_premium:
+                return 0, 0.0   # body above CE = suspension block invalid
+
+        print(f"  🔴 SUSPENSION_BLOCK SELL  SB=[{sb_low:.3f}–{sb_high:.3f}] resistance={swing_high:.3f} CE={ce_premium:.3f} RSI={rsi:.0f}")
+        return -1, swing_high
+
+
+# ─────────────────────────────────────────────
+# EVENT HORIZON DETECTOR (BSL/SSL midpoint bias filter)
+# ─────────────────────────────────────────────
+class EventHorizonDetector:
+    """
+    ICT Event Horizon = 50% midpoint between BSL (buy stops above) and SSL (sell stops below).
+    If price is at Event Horizon → neutral zone → skip directional entry.
+    """
+    LOOKBACK = 50
+    SWING_N  = 3
+
+    def detect(self, df: pd.DataFrame) -> tuple[float, bool]:
+        """Returns (event_horizon_price, is_at_event_horizon)."""
+        if len(df) < self.LOOKBACK:
+            return 0.0, False
+        bars  = df.tail(self.LOOKBACK).reset_index(drop=True)
+        close = float(df.iloc[-1]['close'])
+        atr   = float(df.iloc[-1].get('ATR', 0) or 0)
+        if atr == 0:
+            return 0.0, False
+
+        highs = bars['high'].values
+        lows  = bars['low'].values
+
+        # BSL = most prominent equal highs (retail swing high = buy stops above)
+        bsl = float(np.percentile(highs, 90))
+        # SSL = most prominent equal lows (retail swing low = sell stops below)
+        ssl = float(np.percentile(lows, 10))
+
+        event_horizon = (bsl + ssl) / 2.0
+        band = close * 0.002   # ±0.2% neutral band
+
+        is_neutral = abs(close - event_horizon) <= band
+        return event_horizon, is_neutral
+
+
+# ─────────────────────────────────────────────
+# NY LUNCH CARRY-FORWARD FVG TRACKER
+# ─────────────────────────────────────────────
+class LunchFVGTracker:
+    """
+    ICT NY Lunch Carry-Forward FVG:
+    After BSL or SSL is taken during 12PM–1:30PM NY lunch → the FVG formed
+    immediately BEFORE that liquidity was taken is stored.
+    If price trades into that FVG the NEXT DAY → high-probability reversal.
+    """
+    EST = pytz.timezone('US/Eastern')
+
+    def __init__(self):
+        self._carried_fvg: dict | None = None
+        self._fvg_date: object = None
+
+    def update(self, df: pd.DataFrame):
+        """Call each loop; detects lunch liquidity sweep and stores the pre-sweep FVG."""
+        try:
+            idx = df.index
+            if not isinstance(idx, pd.DatetimeIndex):
+                return
+            if getattr(idx, 'tz', None) is None:
+                idx = idx.tz_localize('UTC')
+            est_idx    = idx.tz_convert(self.EST)
+            today      = est_idx[-1].date()
+            now_h      = est_idx[-1].hour
+            now_m      = est_idx[-1].minute
+            t          = now_h * 60 + now_m
+
+            if not (720 <= t <= 810):   # only track during 12PM–1:30PM
+                return
+            if self._fvg_date == today:
+                return
+
+            # Detect if a swing high or low was just swept in last 5 bars
+            recent     = df.tail(20).reset_index(drop=True)
+            n          = len(recent)
+            prior_high = float(recent.iloc[:-5]['high'].max())
+            prior_low  = float(recent.iloc[:-5]['low'].min())
+            last5_high = float(recent.iloc[-5:]['high'].max())
+            last5_low  = float(recent.iloc[-5:]['low'].min())
+
+            swept_high = last5_high > prior_high
+            swept_low  = last5_low  < prior_low
+
+            if not (swept_high or swept_low):
+                return
+
+            # Find the FVG formed immediately BEFORE the sweep (in bars -10 to -5)
+            pre_sweep = recent.iloc[max(0, n-12): n-5].reset_index(drop=True)
+            m = len(pre_sweep)
+            for i in range(1, m - 1):
+                ph = float(pre_sweep.iloc[i-1]['high'])
+                pl = float(pre_sweep.iloc[i-1]['low'])
+                nh = float(pre_sweep.iloc[i+1]['high'])
+                nl = float(pre_sweep.iloc[i+1]['low'])
+                if swept_high and pl > nh:
+                    self._carried_fvg  = {'type': 'bear', 'low': nh, 'high': pl}
+                    self._fvg_date     = today
+                    print(f"  📌 Lunch carry FVG stored: BEAR [{nh:.3f}–{pl:.3f}] (BSL swept)")
+                    break
+                if swept_low and ph < nl:
+                    self._carried_fvg  = {'type': 'bull', 'low': ph, 'high': nl}
+                    self._fvg_date     = today
+                    print(f"  📌 Lunch carry FVG stored: BULL [{ph:.3f}–{nl:.3f}] (SSL swept)")
+                    break
+        except Exception:
+            pass
+
+    def check_signal(self, df: pd.DataFrame) -> tuple[int, float]:
+        """Returns signal if next-day price trades into carried FVG."""
+        if self._carried_fvg is None:
+            return 0, 0.0
+        try:
+            idx     = df.index
+            if not isinstance(idx, pd.DatetimeIndex):
+                return 0, 0.0
+            if getattr(idx, 'tz', None) is None:
+                idx = idx.tz_localize('UTC')
+            est_idx = idx.tz_convert(self.EST)
+            today   = est_idx[-1].date()
+
+            # Only fire on the NEXT DAY
+            if self._fvg_date == today:
+                return 0, 0.0
+
+            fvg   = self._carried_fvg
+            r     = df.iloc[-1]
+            close = float(r['close'])
+            open_ = float(r['open'])
+            high  = float(r['high'])
+            low   = float(r['low'])
+
+            if fvg['type'] == 'bull' and fvg['low'] <= close <= fvg['high'] and close > open_:
+                print(f"  🟢 LUNCH_CARRY_FVG BUY [{fvg['low']:.3f}–{fvg['high']:.3f}] (next-day reversal)")
+                self._carried_fvg = None
+                return 1, fvg['low']
+
+            if fvg['type'] == 'bear' and fvg['low'] <= close <= fvg['high'] and close < open_:
+                print(f"  🔴 LUNCH_CARRY_FVG SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] (next-day reversal)")
+                self._carried_fvg = None
+                return -1, fvg['high']
+        except Exception:
+            pass
         return 0, 0.0
 
 
@@ -1047,11 +1563,26 @@ class ExecutionEngine:
         self.symbol     = symbol
         self.is_running = True
 
-        # V11: FVG_SCALP + OB_SMC + LS_FVG — three complementary SMC strategies
-        self.fvg_scalp   = FVGScalpStrategy()
-        self.ob_smc      = OrderBlockStrategy()
-        self.ls_fvg      = LiquiditySweepFVGStrategy()
-        self.meta        = MetaController([self.fvg_scalp, self.ob_smc, self.ls_fvg])
+        # V13: Full ICT stack — FVG+OB+LS+JUDAS+OTE+ASIAN_JUDAS+SUSPENSION_BLOCK
+        self.fvg_scalp        = FVGScalpStrategy()
+        self.ob_smc           = OrderBlockStrategy()
+        self.ls_fvg           = LiquiditySweepFVGStrategy()
+        self.ote_strat        = OTEStrategy()
+        self.asian_judas      = AsianRangeJudasStrategy()
+        self.suspension_block = SuspensionBlockStrategy()
+        self.meta = MetaController([
+            self.ls_fvg,           # highest conviction: liquidity sweep + FVG
+            self.asian_judas,      # Judas model: Asian range sweep → NY reversal
+            self.ote_strat,        # OTE: 62–79% Fibonacci retracement entry
+            self.suspension_block, # premium resistance short (ATH/rejection block)
+            self.ob_smc,           # order block retest
+            self.fvg_scalp,        # fresh FVG first-touch scalp
+        ])
+
+        # New ICT filter modules
+        self.ict_session      = ICTSessionFilter()
+        self.event_horizon    = EventHorizonDetector()
+        self.lunch_fvg        = LunchFVGTracker()
         self.analytics     = AnalyticsEngine()
 
         self.connection  = None
@@ -1118,6 +1649,10 @@ class ExecutionEngine:
         # Daily EMA200 macro filter (legacy — still active as secondary check)
         self._daily_ema200      = None
         self._daily_ema200_date = None
+
+        # MTF zone cache — refresh every 15 min, not every loop
+        self._mtf_zones: dict = {}
+        self._mtf_zones_ts: float = 0.0
 
         # Daily trade counter + circuit breaker
         self.max_daily_trades   = int(os.getenv('MAX_DAILY_TRADES', '9'))
@@ -1193,25 +1728,11 @@ class ExecutionEngine:
         return float(scaled.to_integral_value(rounding=rmap[direction]) * pt)
 
     def _build_levels(self, side: str, entry: float, wick: float):
-        """
-        Fixed SL/TP mode: uses SL_POINTS env var (default 0.30 pts for $3 at 0.01 lot).
-        Falls back to IFVG wick-based dynamic SL if SL_POINTS not set.
-        """
-        sl_pts  = float(os.getenv('SL_POINTS',  '0.30'))
-        tp_mult = float(os.getenv('TP_MULT',    '3.0'))   # V12: 1:3 RR → 60% WR target
+        """SL strictly 2 ticks below zone low (BUY) / above zone high (SELL). TP = risk × TP_MULT."""
+        tp_mult = float(os.getenv('TP_MULT', '3.0'))
         min_d   = self._min_stop()
+        buf     = self._point() * 2  # 2 ticks beyond zone boundary
 
-        if sl_pts > 0:
-            if side == 'BUY':
-                sl = self._snap(entry - max(sl_pts, min_d), 'down')
-                tp = self._snap(entry + sl_pts * tp_mult,   'up')
-            else:
-                sl = self._snap(entry + max(sl_pts, min_d), 'up')
-                tp = self._snap(entry - sl_pts * tp_mult,   'down')
-            return sl, tp
-
-        # Dynamic fallback (IFVG boundary)
-        buf = self._point()
         if side == 'BUY':
             desired_sl = wick - buf
             sl   = self._snap(min(desired_sl, entry - min_d), 'down')
@@ -1300,10 +1821,64 @@ class ExecutionEngine:
 
     # ── candle fetch ──
 
+    async def _fetch_mtf_zones(self) -> dict:
+        """Fetch 15m, 1h, 4h swing ranges — cached 15 min, 30s timeout per TF."""
+        now = time.time()
+        if now - self._mtf_zones_ts < 900 and self._mtf_zones:
+            return self._mtf_zones
+        zones = {}
+        for tf, days, count in [('15m', 3, 100), ('1h', 10, 100), ('4h', 30, 100)]:
+            try:
+                start   = datetime.now(timezone.utc) - timedelta(days=days)
+                candles = await asyncio.wait_for(
+                    self.account.get_historical_candles(self.symbol, tf, start, count),
+                    timeout=30
+                )
+                if not candles or len(candles) < 20:
+                    continue
+                recent     = candles[-50:] if len(candles) >= 50 else candles
+                swing_high = max(c['high'] for c in recent)
+                swing_low  = min(c['low']  for c in recent)
+                mid        = (swing_high + swing_low) / 2.0
+                cur        = float(candles[-1]['close'])
+                zones[tf]  = {
+                    'midpoint':    mid,
+                    'in_discount': cur < mid,
+                    'in_premium':  cur > mid,
+                }
+            except asyncio.TimeoutError:
+                print(f"⚠️  MTF zone {tf}: timeout — skipping")
+            except Exception as e:
+                print(f"⚠️  MTF zone {tf}: {e}")
+        if zones:
+            self._mtf_zones = zones
+            self._mtf_zones_ts = now
+        return self._mtf_zones
+
+    def _check_mtf_zone(self, mtf_zones: dict, side: str) -> tuple[bool, str]:
+        """All three of 15m, 1h, 4h must confirm discount (BUY) or premium (SELL)."""
+        required = ['15m', '1h', '4h']
+        missing  = [tf for tf in required if tf not in mtf_zones]
+        if missing:
+            return False, f"MTF data unavailable: {missing}"
+        if side == 'BUY':
+            fails = [tf for tf in required if not mtf_zones[tf]['in_discount']]
+            if fails:
+                return False, f"Not in discount on {fails}"
+            mids = ' | '.join(f"{tf}:{mtf_zones[tf]['midpoint']:.2f}" for tf in required)
+            return True, f"Discount ✅ {mids}"
+        else:
+            fails = [tf for tf in required if not mtf_zones[tf]['in_premium']]
+            if fails:
+                return False, f"Not in premium on {fails}"
+            mids = ' | '.join(f"{tf}:{mtf_zones[tf]['midpoint']:.2f}" for tf in required)
+            return True, f"Premium ✅ {mids}"
+
     async def _fetch_candles(self) -> pd.DataFrame:
         start_time = datetime.now(timezone.utc) - timedelta(days=5)
-        candles = await self.account.get_historical_candles(
-            self.symbol, '5m', start_time, 500
+        candles = await asyncio.wait_for(
+            self.account.get_historical_candles(self.symbol, '5m', start_time, 500),
+            timeout=60
         )
         if not candles:
             raise RuntimeError('No candles returned')
@@ -1317,7 +1892,10 @@ class ExecutionEngine:
             return  # already fresh for today
         try:
             start = datetime.now(timezone.utc) - timedelta(days=300)
-            candles = await self.account.get_historical_candles(self.symbol, '1d', start, 220)
+            candles = await asyncio.wait_for(
+                self.account.get_historical_candles(self.symbol, '1d', start, 220),
+                timeout=60
+            )
             if candles and len(candles) >= 200:
                 closes = pd.Series([c['close'] for c in candles])
                 ema = ta.ema(closes, length=200)
@@ -1330,7 +1908,7 @@ class ExecutionEngine:
     # ── main loop ──
 
     async def run(self):
-        print(f"🔱 SHIVA V12 LIVE | {self.symbol} | FVG+OB+LS | ADX25+RSI55-68 | 60%WR | Max {self.max_daily_trades}/day")
+        print(f"🔱 SHIVA V13 LIVE | {self.symbol} | ICT Full Stack | AMD+Judas+OTE+SuspBlock | Max {self.max_daily_trades}/day")
         self.api = MetaApi(self.token)
         try:
             self.account = await self.api.metatrader_account_api.get_account(self.account_id)
@@ -1374,9 +1952,37 @@ class ExecutionEngine:
                     if df.empty:
                         raise RuntimeError('Empty indicator frame')
 
-                    positions = await self.connection.get_positions()
+                    r = df.iloc[-1]
+                    _dbg_close = float(r.get('close', 0) or 0)
+                    _dbg_rsi   = float(r.get('RSI', 0)   or 0)
+                    _dbg_atr   = float(r.get('ATR', 0)   or 0)
+                    _dbg_adx   = float(r.get('ADX_14', 0) or 0)
+                    print(f"🔄 Loop | close={_dbg_close:.3f}  RSI={_dbg_rsi:.1f}  ATR={_dbg_atr:.3f}  ADX={_dbg_adx:.1f}  trades={self.daily_trades}")
+
+                    # Multi-timeframe discount/premium zone map (cached 15 min)
+                    mtf_zones = await self._fetch_mtf_zones()
+
+                    positions = await asyncio.wait_for(self.connection.get_positions(), timeout=30)
                     live_ids  = {p['id'] for p in positions}
                     current   = next((p for p in positions if p['symbol'] == self.symbol), None)
+
+                    # --- AUTO SL/TP FIXER ---
+                    for p in positions:
+                        if p['symbol'] == self.symbol and p['id'] in live_ids:
+                            sl_val = p.get('stopLoss') or 0.0
+                            tp_val = p.get('takeProfit') or 0.0
+                            if sl_val == 0.0 or tp_val == 0.0:
+                                side = 'BUY' if 'BUY' in str(p.get('type', '')).upper() else 'SELL'
+                                entry_p = float(p.get('openPrice', 0))
+                                if entry_p > 0:
+                                    f_sl, f_tp = self._build_levels(side, entry_p, entry_p)
+                                    print(f"🔧 Auto-fixing missing SL/TP for {p['id']} ({side}) -> SL: {f_sl:.3f}, TP: {f_tp:.3f}")
+                                    try:
+                                        await self.connection.modify_position(p['id'], stop_loss=f_sl, take_profit=f_tp)
+                                    except Exception as e:
+                                        print(f"⚠️ Modify position error: {e}")
+                    # ------------------------
+
 
                     await self._process_closed_positions(live_ids)
 
@@ -1401,13 +2007,21 @@ class ExecutionEngine:
                         await asyncio.sleep(300)
                         continue
 
-                    # Phase 2: Kill Zone gate
+                    # Phase 2: Kill Zone gate (log only — no hard block)
                     kz_result = None
                     if self.kill_zone_agent:
                         kz_result = self.kill_zone_agent.check()
-                        if not kz_result.allowed:
-                            await asyncio.sleep(30)
-                            continue
+
+                    # ICT Session Filter (AMD cycle + DOW rules + TGIF)
+                    ict_session = self.ict_session.check()
+                    _ict_allowed, _ict_reason = self.ict_session.allows_entry(ict_session, 0)
+                    if not _ict_allowed:
+                        print(f"⏳ ICT session gate: {_ict_reason}")
+                        await asyncio.sleep(60)
+                        continue
+
+                    # Update lunch carry-forward FVG tracker
+                    self.lunch_fvg.update(df)
 
                     # Phase 3: News gate
                     if self.news_agent:
@@ -1428,7 +2042,40 @@ class ExecutionEngine:
 
                     # Get signal
                     if not current:
-                        sig, wick, strat_name = self.meta.get_signal_and_wick(df)
+                        # Check lunch carry-forward FVG first (highest conviction)
+                        lunch_sig, lunch_wick = self.lunch_fvg.check_signal(df)
+                        if lunch_sig != 0:
+                            sig, wick, strat_name = lunch_sig, lunch_wick, 'LUNCH_CARRY_FVG'
+                        else:
+                            sig, wick, strat_name = self.meta.get_signal_and_wick(df)
+
+                        # Event Horizon gate: skip if price is at BSL/SSL midpoint
+                        if sig != 0:
+                            _eh, _at_eh = self.event_horizon.detect(df)
+                            if _at_eh:
+                                print(f"⚠️  Event Horizon neutral zone ({_eh:.3f}) — skip entry")
+                                sig = 0
+
+                        # TGIF Friday filter: on Friday PM, only allow fade trades
+                        if sig != 0 and ict_session.get('friday_fade'):
+                            bars_week = df.tail(200)
+                            weekly_high = float(bars_week['high'].max())
+                            weekly_low  = float(bars_week['low'].min())
+                            weekly_range = weekly_high - weekly_low
+                            cur_close   = float(df.iloc[-1]['close'])
+                            # TGIF: block fresh longs near weekly high on Friday PM
+                            if sig == 1 and (weekly_high - cur_close) < weekly_range * 0.20:
+                                print(f"🚫 TGIF: blocking BUY near weekly high ({weekly_high:.3f}) on Friday")
+                                sig = 0
+                            # TGIF: block fresh shorts near weekly low on Friday PM
+                            if sig == -1 and (cur_close - weekly_low) < weekly_range * 0.20:
+                                print(f"🚫 TGIF: blocking SELL near weekly low ({weekly_low:.3f}) on Friday")
+                                sig = 0
+
+                        # DOW rule: log when Tuesday (highest probability day)
+                        if ict_session.get('is_tuesday') and sig != 0:
+                            print(f"✅ DOW: Tuesday — highest probability for weekly extreme (bias={strat_name})")
+
                         # Phase 1: HTF Bias gate (primary) — supersedes legacy EMA200 filter
                         if sig != 0 and self.htf_bias_agent:
                             bias = self.htf_bias_agent.current_bias
@@ -1450,6 +2097,20 @@ class ExecutionEngine:
                                 elif sig == -1 and cur_close > self._daily_ema200:
                                     print(f"🚫 SELL blocked (legacy EMA200): close {cur_close:.2f} > {self._daily_ema200:.2f}")
                                     sig = 0
+                        # Macro EMA+RSI fallback when SMC strategies find nothing
+                        if sig == 0:
+                            _r     = df.iloc[-1]
+                            _close = float(_r['close'])
+                            _ema200= float(_r.get('EMA_200', _close) or _close)
+                            _rsi   = float(_r.get('RSI', 50) or 50)
+                            _low   = float(_r['low'])
+                            _high  = float(_r['high'])
+                            if _close > _ema200 and 30 <= _rsi <= 75:
+                                sig, wick, strat_name = 1, _low, 'TREND_EMA_BULL'
+                                print(f"📈 Macro fallback BUY  close={_close:.3f} EMA200={_ema200:.3f} RSI={_rsi:.1f}")
+                            elif _close < _ema200 and 25 <= _rsi <= 70:
+                                sig, wick, strat_name = -1, _high, 'TREND_EMA_BEAR'
+                                print(f"📉 Macro fallback SELL close={_close:.3f} EMA200={_ema200:.3f} RSI={_rsi:.1f}")
                     else:
                         sig, wick, strat_name = 0, 0.0, ''
 
@@ -1461,44 +2122,18 @@ class ExecutionEngine:
                         regime_label  = regime_result.regime.value
                         regime_size_factor = regime_result.size_factor
 
-                    # ── Backtest-proven signal filters (WR 28%, PF 1.975) ──────────────────
-                    if sig != 0:
-                        import zoneinfo as _zi
-                        _now_est = datetime.now(timezone.utc).astimezone(_zi.ZoneInfo("US/Eastern"))
-
-                        # 1. TRENDING_BULL only (RANGING=11.9% WR, TRENDING_BEAR=12.3% — both below BE)
-                        if regime_label and regime_label != "TRENDING_BULL":
-                            print(f"🚫 Signal blocked — regime {regime_label} (only TRENDING_BULL allowed)")
+                    # ── Direction alignment: TRENDING_BULL→BUY only, TRENDING_BEAR→SELL only ──
+                    if sig != 0 and regime_label:
+                        if regime_label == "HIGH_VOLATILITY":
+                            print(f"🚫 Signal blocked — HIGH_VOLATILITY regime (size risk)")
                             sig = 0
-
-                        # 2. BUY direction only in bull regime (SELL WR=9.1% vs BUY WR=18.9%)
-                        if sig == -1:
-                            print("🚫 SELL blocked — BUY-only policy in TRENDING_BULL regime")
+                        elif regime_label == "TRENDING_BULL" and sig == -1:
+                            print("🚫 SELL blocked — BUY-only in TRENDING_BULL")
                             sig = 0
-
-                        # 3. Skip Monday EST (illiquid weekly open + low WR)
-                        if sig != 0 and _now_est.weekday() == 0:
-                            print("🚫 Signal blocked — Monday EST (low WR day)")
+                        elif regime_label == "TRENDING_BEAR" and sig == 1:
+                            print("🚫 BUY blocked — SELL-only in TRENDING_BEAR")
                             sig = 0
-
-                        # 4. Skip Wednesday EST (WR=8.9% in backtest)
-                        if sig != 0 and _now_est.weekday() == 2:
-                            print("🚫 Signal blocked — Wednesday EST (worst WR day)")
-                            sig = 0
-
-                        # 5. Skip Friday after 10am EST (weekend gap prevention)
-                        if sig != 0 and _now_est.weekday() == 4 and _now_est.hour >= 10:
-                            print("🚫 Signal blocked — Friday after 10am EST (weekend gap risk)")
-                            sig = 0
-
-                        # 6. ATR spike filter — extreme volatility bars cause gap losses
-                        if sig != 0 and "ATR" in df.columns and len(df) >= 20:
-                            _atr_now = float(df["ATR"].iloc[-1] or 0)
-                            _atr_ma  = float(df["ATR"].rolling(20).mean().iloc[-1] or 0)
-                            if _atr_ma > 0 and _atr_now > 2.5 * _atr_ma:
-                                print(f"🚫 Signal blocked — ATR spike {_atr_now:.3f} > 2.5×avg {_atr_ma:.3f}")
-                                sig = 0
-                    # ──────────────────────────────────────────────────────────────────────
+                    # ─────────────────────────────────────────────────────────────────────
 
                     # Phase 6: CNN Ensemble signal
                     cnn_dir, cnn_conf = 0, 0.0
@@ -1516,52 +2151,35 @@ class ExecutionEngine:
                             wick  = judas_result.fvg_low if sig == 1 else judas_result.fvg_high
                             strat_name = "JUDAS_SWING"
 
-                    # Phase 4: Confluence gate — score signal before execution
+                    # Phase 4: Confluence gate — disabled, log only
                     confluence_score = 0
                     entry_size_label = "FULL"
-                    if sig != 0 and self.confluence_scorer:
-                        mstate = MarketState(
-                            signal=sig,
-                            df=df,
-                            htf_bias_score=self.htf_bias_agent.bias_score() if self.htf_bias_agent else 0,
-                            htf_bias_label=self.htf_bias_agent.current_bias.bias.value if (
-                                self.htf_bias_agent and self.htf_bias_agent.current_bias) else "NEUTRAL",
-                            kill_zone_active=kz_result.allowed if kz_result else True,
-                            session_name=kz_result.session.value if kz_result else "",
-                            cnn_confidence=cnn_conf,
-                            cnn_direction=cnn_dir,
-                            regime=regime_label,
-                        )
-                        conf_result = self.confluence_scorer.score(mstate)
-                        confluence_score = conf_result.score
-                        entry_size_label = conf_result.entry_size.value
-                        if not conf_result.allows_entry:
-                            sig = 0  # below threshold — block trade
+
+                    # MTF discount/premium zone — log only, does not block
+                    if sig != 0 and wick != 0.0:
+                        side_str   = 'BUY' if sig == 1 else 'SELL'
+                        mtf_ok, mtf_reason = self._check_mtf_zone(mtf_zones, side_str)
+                        print(f"{'✅' if mtf_ok else '⚠️ '} MTF zone: {mtf_reason}")
 
                     # Execute
                     if not current and sig != 0 and wick != 0.0:
-                        # Dynamic lot based on live balance
                         balance = await self._get_balance()
                         lot     = compute_lot_size(balance)
                         price   = await self._get_price()
+                        lot_adj = round(lot * regime_size_factor * (
+                            self.circuit_breaker._size_factor if self.circuit_breaker else 1.0
+                        ), 2)
+                        lot_adj = max(lot_adj, 0.01)
 
-                        # Phase 8: dynamic SL/TP (falls back to fixed if unavailable)
+                        _atr_live = float(df.iloc[-1].get('ATR', 0) or 0) or 0.3
                         if sig == 1:
-                            entry = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
-                            if self.dynamic_sl:
-                                dyn = self.dynamic_sl.compute('BUY', entry, df, self._point(), self._min_stop())
-                                if not dyn.valid:
-                                    print(f"🚫 BUY skipped: {dyn.reason}")
-                                    await asyncio.sleep(30)
-                                    continue
-                                sl, tp = dyn.sl, dyn.tp1  # tp1=1:1, tp2=runner (Phase 8)
+                            entry  = float(price.get('ask') or price.get('bid') or df.iloc[-1]['close'])
+                            # BUY wick must be BELOW entry; clamp to 1.5–2×ATR
+                            if wick >= entry:
+                                wick = entry - _atr_live * 1.5
                             else:
-                                sl, tp = self._build_levels('BUY', entry, wick)
-                            # Phase 9: apply size factor from regime + circuit breaker
-                            lot_adj = round(lot * regime_size_factor * (
-                                self.circuit_breaker._size_factor if self.circuit_breaker else 1.0
-                            ), 2)
-                            lot_adj = max(lot_adj, 0.01)
+                                wick = max(wick, entry - _atr_live * 2)
+                            sl, tp = self._build_levels('BUY', entry, wick)
                             sl_usd = abs(entry - sl) * lot_adj * 1000
                             tp_usd = abs(tp - entry) * lot_adj * 1000
                             print(f"🚀 BUY  {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot_adj} | bal=${balance:.0f} | [{strat_name}] conf={confluence_score}")
@@ -1570,20 +2188,13 @@ class ExecutionEngine:
                                 {'comment': f'SHIVA:{strat_name}'},
                             )
                         else:
-                            entry = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
-                            if self.dynamic_sl:
-                                dyn = self.dynamic_sl.compute('SELL', entry, df, self._point(), self._min_stop())
-                                if not dyn.valid:
-                                    print(f"🚫 SELL skipped: {dyn.reason}")
-                                    await asyncio.sleep(30)
-                                    continue
-                                sl, tp = dyn.sl, dyn.tp1
+                            entry  = float(price.get('bid') or price.get('ask') or df.iloc[-1]['close'])
+                            # SELL wick must be ABOVE entry; clamp to 1.5–2×ATR
+                            if wick <= entry:
+                                wick = entry + _atr_live * 1.5
                             else:
-                                sl, tp = self._build_levels('SELL', entry, wick)
-                            lot_adj = round(lot * regime_size_factor * (
-                                self.circuit_breaker._size_factor if self.circuit_breaker else 1.0
-                            ), 2)
-                            lot_adj = max(lot_adj, 0.01)
+                                wick = min(wick, entry + _atr_live * 2)
+                            sl, tp = self._build_levels('SELL', entry, wick)
                             sl_usd = abs(sl - entry) * lot_adj * 1000
                             tp_usd = abs(entry - tp) * lot_adj * 1000
                             print(f"📉 SELL {self.symbol} @ {entry:.2f} | SL {sl:.2f} (${sl_usd:.0f}) | TP {tp:.2f} (${tp_usd:.0f}) | lot={lot_adj} | bal=${balance:.0f} | [{strat_name}] conf={confluence_score}")
