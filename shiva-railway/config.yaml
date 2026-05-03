@@ -200,9 +200,9 @@ dynamic_sl:
 
 # ── Phase 9: Circuit Breaker ─────────────────────────────────────────────
 circuit_breaker:
-  max_daily_losses: 2
-  max_daily_drawdown_pct: 2.0
-  max_daily_trades: 20
+  max_daily_losses: 5
+  max_daily_drawdown_pct: 5.0
+  max_daily_trades: 50
   wr_review_window: 20
   wr_alert_threshold: 0.50
   size_reduction_on_alert: 0.50

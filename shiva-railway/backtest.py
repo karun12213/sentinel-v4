@@ -206,21 +206,17 @@ def run(df: pd.DataFrame, label: str,
             if date in daily_broken:
                 continue
 
-            # ICT session gate: skip Asian accumulation, NY lunch, Monday open
+            # Session gate: block overnight dead zone (1AM–6AM EST) + NY lunch
             import pytz
             try:
                 _est = pytz.timezone('US/Eastern')
                 _t_est = t.tz_convert(_est) if hasattr(t, 'tz_convert') else t
                 _h = _t_est.hour; _m = _t_est.minute; _tm = _h*60+_m
-                _dow = _t_est.weekday()
-                # Block Asian accumulation (7PM–2AM)
-                if _tm >= 1140 or _tm < 120:
+                # Block 1AM–6AM EST dead zone
+                if 60 <= _tm < 360:
                     continue
-                # Block NY lunch re-accumulation (12PM–1:30PM)
+                # Block NY lunch (12PM–1:30PM)
                 if 720 <= _tm < 810:
-                    continue
-                # Block Monday first 30min
-                if _dow == 0 and _tm < 570:
                     continue
             except Exception:
                 pass
@@ -237,14 +233,9 @@ def run(df: pd.DataFrame, label: str,
             for strat in strategies:
                 s_sig, s_wick = strat.get_signal_and_wick(feat)
                 if s_sig != 0:
-                    # Per-strategy EMA200 gate (V13 BEST config):
-                    # BUY strategies: only fire above daily EMA200
-                    # SELL: only SuspensionBlock fires, only below daily EMA200
-                    _buy_strats  = {'LS_FVG', 'OB_SMC', 'FVG_SCALP'}
-                    _sell_strats = {'SUSPENSION_BLOCK'}
+                    # EMA200 direction gate: all strategies follow EMA200 trend
+                    # Above EMA200 → only BUY; below EMA200 → only SELL
                     _sname = strat.name
-                    if s_sig == -1 and _sname not in _sell_strats:
-                        continue   # only SuspensionBlock can SELL
                     if daily_ema200 is not None:
                         cur_close = float(bar['close'])
                         try:
@@ -263,13 +254,11 @@ def run(df: pd.DataFrame, label: str,
             if sig == 0:
                 continue
 
-            # ML gate — only active after MIN_TRADES history
+            # ML: score only, never blocks
             ml_features = None
             if ml:
                 ml_features = ml.extract_features(feat, sig)
-                ml_conf, ml_ok = ml.predict(ml_features)
-                if not ml_ok:
-                    continue   # ML blocked low-confidence signal
+                ml_conf, _ = ml.predict(ml_features)
 
             entry = float(bar['close'])
             side  = 'BUY' if sig == 1 else 'SELL'
@@ -422,23 +411,24 @@ def run(df: pd.DataFrame, label: str,
 # ─────────────────────────────────────────────
 # PROJECTION: weeks to $500/week
 # ─────────────────────────────────────────────
-def project_to_500_per_week(ev_per_trade: float, trades_per_week: float,
-                             initial_capital: float = 100.0,
-                             target_weekly: float = 500.0,
-                             max_weeks: int = 52):
+def project_to_target_per_week(ev_per_trade: float, trades_per_week: float,
+                                initial_capital: float = 100.0,
+                                target_weekly: float = 400.0,
+                                max_weeks: int = 104):
     """
     Simulate week-by-week compounding with dynamic lot scaling every $100.
     ev_per_trade: expected P&L per trade at 0.01 lot (base)
     trades_per_week: estimated signal frequency per week
     """
     print("\n" + "=" * 70)
-    print("  PROJECTION — Compounding to $500/week")
+    print(f"  PROJECTION — Compounding to ${target_weekly:,.0f}/week")
     print(f"  EV/trade @ 0.01 lot: ${ev_per_trade:.2f}  |  Trades/week: {trades_per_week:.1f}")
     print("=" * 70)
     print(f"  {'Week':>4}  {'Capital':>10}  {'Lot':>6}  {'Weekly P&L':>12}  {'Status'}")
     print(f"  {'-'*55}")
 
     cap = initial_capital
+    hit_week = None
     for week in range(1, max_weeks + 1):
         lot     = compute_lot_size(cap)
         scale   = lot / 0.01
@@ -446,11 +436,12 @@ def project_to_500_per_week(ev_per_trade: float, trades_per_week: float,
         cap    += weekly
         cap     = max(cap, 1.0)
         status  = ''
-        if weekly >= target_weekly and not status:
-            status = f'  ← 🎯 $500/week reached at week {week}!'
+        if weekly >= target_weekly and hit_week is None:
+            hit_week = week
+            status = f'  ← TARGET ${target_weekly:,.0f}/week!'
         print(f"  {week:>4}  ${cap:>9,.0f}  {lot:>6.2f}  ${weekly:>+11,.0f}{status}")
         if weekly >= target_weekly:
-            print(f"\n  ✅ TARGET REACHED: week {week} | capital ${cap:,.0f} | weekly ${weekly:,.0f}")
+            print(f"\n  TARGET REACHED: week {week} | capital ${cap:,.0f} | weekly ${weekly:,.0f}")
             break
     else:
         print(f"\n  Final: week {max_weeks} | capital ${cap:,.0f} | weekly ${ev_per_trade * compute_lot_size(cap)/0.01 * trades_per_week:,.0f}")
@@ -462,23 +453,17 @@ def project_to_500_per_week(ev_per_trade: float, trades_per_week: float,
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
     print("=" * 70)
-    print("  SHIVA V13 — ICT Full Stack | 9-Month Backtest | USOIL (CL=F)")
-    print("  Strategies: LS_FVG + OTE + ASIAN_JUDAS + SUSPENSION_BLOCK + OB + FVG")
-    print("  Filters: ICT session gate (no Asian/Lunch) | DOW rules | Daily EMA200")
+    print("  SHIVA V13 MAX — All Strategies | 9-Month Backtest | USOIL (CL=F)")
+    print("  Strategies: ALL 4 (LS_FVG + OB_SMC + FVG_SCALP + SUSPENSION_BLOCK)")
+    print("  Max trades mode: 50/day | cooldown=0 | SL=0.30 TP=1.80 (1:6 RR)")
+    print("  Target: $400/week via compounding")
     print("=" * 70)
     print()
 
-    # NOTE: yfinance 15m data is limited to last 60 days.
-    # For 9-month history, we use 1h bars (yfinance supports up to 2yr for 1h).
-    # Live bot uses 5m candles — 1h backtest is a reasonable proxy for signal logic.
-
-    # ── 9 months of 1h data ──
     nine_months_ago = (datetime.now(timezone.utc) - timedelta(days=274)).strftime('%Y-%m-%d')
-    print(f"⚠️  Note: yfinance 15m limited to 60 days. Using 1h bars for 9-month history.")
-    print(f"   (Live bot uses 5m candles — same signals, 3× frequency expected)\n")
     df_1h = fetch('1h', start=nine_months_ago)
 
-    # Fetch daily data for daily EMA200 macro trend filter
+    # Daily EMA200 for macro trend filter
     daily_start = (datetime.now(timezone.utc) - timedelta(days=274 + 300)).strftime('%Y-%m-%d')
     df_daily_trend = fetch('1d', start=daily_start)
     daily_ema200_series = None
@@ -490,71 +475,82 @@ if __name__ == '__main__':
             _ema   = _ema.dropna()
             _ema.index = pd.to_datetime(_ema.index).tz_localize(None)
             daily_ema200_series = _ema
-            print(f"   Daily EMA200 loaded: {len(_ema)} values  ({_ema.index[0].date()} → {_ema.index[-1].date()})")
+            print(f"   Daily EMA200: {len(_ema)} values  ({_ema.index[0].date()} → {_ema.index[-1].date()})")
         except Exception as e:
-            print(f"   ⚠️  Daily EMA200 failed: {e}")
+            print(f"   Daily EMA200 failed: {e}")
 
-    # V13 BEST: BUY=LS_FVG+OB_SMC+FVG_SCALP (above EMA200), SELL=SuspensionBlock (below EMA200)
     os.environ['SELL_ENABLED'] = '1'
-    BEST_STRATS = [
+    ALL_STRATS = [
         LiquiditySweepFVGStrategy(),
         SuspensionBlockStrategy(),
         OrderBlockStrategy(),
         FVGScalpStrategy(),
     ]
+
+    # MAX TRADES: all strategies, both directions, 50/day, no cooldown, 1:6 RR
     trades_1h = run(
         df_1h,
-        label=f'1H  |  {nine_months_ago} → today  (~9 months)  [V13 BEST: LS_FVG+OB+FVG(BUY>EMA200) + SuspBlock(SELL<EMA200) | SL=0.50 TP=1.50 | RR 1:3]',
+        label=f'1H MAX | {nine_months_ago} → today | ALL strats | SL=0.30 TP=1.80 (1:6 RR) | 50/day',
         initial_capital=100.0,
-        sl_pts=0.50,
-        tp_pts=1.50,
-        cooldown_bars=1,
-        max_daily_trades=9,
-        strategy_list=BEST_STRATS,
+        sl_pts=0.30,
+        tp_pts=1.80,
+        cooldown_bars=0,
+        max_daily_trades=50,
+        strategy_list=ALL_STRATS,
         daily_ema200=daily_ema200_series,
+        use_ml=True,
     )
 
-    # ── 15m last 60 days ──
-    print("📊 Running 15m backtest (last 60 days)…\n")
+    # 15m last 60 days (live-closer proxy)
+    print("\n Running 15m backtest (last 60 days)…\n")
     df_15m = fetch('15m', period='60d')
     trades_15 = run(
         df_15m.copy(),
-        label='15M  |  last 60 days  [V13 BEST: LS_FVG+OB+FVG(BUY>EMA200) + SuspBlock(SELL<EMA200) | SL=0.30 TP=0.90]',
+        label='15M MAX | last 60 days | ALL strats | SL=0.30 TP=1.80 | 50/day',
         initial_capital=100.0,
         sl_pts=0.30,
-        tp_pts=0.90,
-        cooldown_bars=1,
-        max_daily_trades=9,
-        strategy_list=[s.__class__() for s in BEST_STRATS],
+        tp_pts=1.80,
+        cooldown_bars=0,
+        max_daily_trades=50,
+        strategy_list=[s.__class__() for s in ALL_STRATS],
         daily_ema200=daily_ema200_series,
+        use_ml=True,
     )
 
-    # ── Save & print all trades ──
     pd.set_option('display.width', 220)
     pd.set_option('display.max_rows', None)
-
     cols = ['trade_no', 'date', 'entry_time', 'exit_time', 'strategy',
             'side', 'lot', 'sl_usd', 'tp_usd', 'entry', 'sl', 'tp',
             'exit', 'hit', 'pnl', 'capital', 'result']
 
     if not trades_1h.empty:
-        trades_1h.to_csv('backtest_1h_trades.csv', index=False)
-        print(f"📝 1h trade log  → backtest_1h_trades.csv  ({len(trades_1h)} trades)")
-        print("\n─── ALL 1H TRADES ──────────────────────────────────────────────────────────")
+        trades_1h.to_csv('v13_maxtrades_1h.csv', index=False)
+        print(f"\n 1h trade log → v13_maxtrades_1h.csv  ({len(trades_1h)} trades)")
+        print("\n─── ALL 1H TRADES ─────────────────────────────────────────────────────────")
         print(trades_1h[cols].to_string(index=False))
 
     if not trades_15.empty:
-        trades_15.to_csv('backtest_15m_trades.csv', index=False)
-        print(f"\n📝 15m trade log → backtest_15m_trades.csv  ({len(trades_15)} trades)")
+        trades_15.to_csv('v13_maxtrades_15m.csv', index=False)
+        print(f"\n 15m trade log → v13_maxtrades_15m.csv  ({len(trades_15)} trades)")
 
-    # ── Projection ──
-    ref = trades_1h if not trades_1h.empty else trades_15
-    if not ref.empty:
-        n_ref   = len(ref)
-        days_ref = ref['date'].nunique()
-        weeks_ref = max(days_ref / 5, 1)
-        tpw = n_ref / weeks_ref
-        ev_per = ref['pnl'].sum() / n_ref / max(ref['lot'].iloc[0] / 0.01, 1)
-        print(f"\n📈 Observed: {tpw:.1f} trades/week  |  EV/trade @ 0.01 lot: ${ev_per:.2f}")
-        print("\n── Live 5m estimate (3× denser) ──")
-        project_to_500_per_week(ev_per, tpw * 3)
+    # Projection to $400/week — use 15m data (closer to live 5m)
+    if not trades_15.empty:
+        n15     = len(trades_15)
+        d15     = trades_15['date'].nunique()
+        tpw15   = n15 / max(d15 / 5, 1)
+        # EV at 0.01 lot base (only use early trades at 0.01 lot for accuracy)
+        base_trades = trades_15[trades_15['lot'] == 0.01]
+        if len(base_trades) >= 5:
+            ev_per = base_trades['pnl'].sum() / len(base_trades)
+        else:
+            ev_per = trades_15['pnl'].sum() / n15 / max(trades_15['lot'].mean() / 0.01, 1)
+        print(f"\n Observed 15m: {tpw15:.1f} trades/week  |  EV/trade @ 0.01 lot: ${ev_per:.2f}")
+        print(f"  Live 5m ≈ same density as 15m")
+        project_to_target_per_week(ev_per, tpw15, target_weekly=400.0)
+    elif not trades_1h.empty:
+        n_ref    = len(trades_1h)
+        days_ref = trades_1h['date'].nunique()
+        tpw      = n_ref / max(days_ref / 5, 1)
+        ev_per   = trades_1h['pnl'].sum() / n_ref
+        print(f"\n Observed 1H: {tpw:.1f} trades/week  |  EV/trade @ 0.01 lot: ${ev_per:.2f}")
+        project_to_target_per_week(ev_per, tpw * 3, target_weekly=400.0)

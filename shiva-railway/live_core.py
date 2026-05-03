@@ -1997,22 +1997,13 @@ class ExecutionEngine:
                         else:
                             sig, wick, strat_name = self.meta.get_signal_and_wick(df)
 
-                        # Per-strategy EMA200 gate (best-strategy config):
-                        # BUY strategies (LS_FVG, OB_SMC, FVG_SCALP) only fire above daily EMA200
-                        # SELL strategies (SUSPENSION_BLOCK) only fire below daily EMA200
+                        # EMA200 gate: all strategies can BUY and SELL freely
+                        # Log EMA200 position for awareness only
                         if sig != 0 and self._daily_ema200 is not None:
                             _cc = float(df.iloc[-1]['close'])
-                            _buy_strats  = {'LS_FVG', 'OB_SMC', 'FVG_SCALP', 'LUNCH_CARRY_FVG'}
-                            _sell_strats = {'SUSPENSION_BLOCK'}
-                            if sig == 1 and strat_name in _buy_strats and _cc < self._daily_ema200:
-                                print(f"🚫 {strat_name} BUY blocked: below daily EMA200 ({_cc:.2f} < {self._daily_ema200:.2f})")
-                                sig = 0
-                            elif sig == -1 and strat_name in _sell_strats and _cc > self._daily_ema200:
-                                print(f"🚫 {strat_name} SELL blocked: above daily EMA200 ({_cc:.2f} > {self._daily_ema200:.2f})")
-                                sig = 0
-                            elif sig == -1 and strat_name not in _sell_strats:
-                                print(f"🚫 {strat_name} SELL blocked: not a designated SELL strategy in best config")
-                                sig = 0
+                            _side_lbl = 'BUY' if sig == 1 else 'SELL'
+                            _ema_side = 'above' if _cc > self._daily_ema200 else 'below'
+                            print(f"📊 {strat_name} {_side_lbl} | price {_ema_side} EMA200 ({_cc:.2f} vs {self._daily_ema200:.2f})")
 
                         # Event Horizon gate: skip if price is at BSL/SSL midpoint
                         if sig != 0:
