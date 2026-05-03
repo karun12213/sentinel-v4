@@ -2113,16 +2113,14 @@ class ExecutionEngine:
                         mtf_ok, mtf_reason = self._check_mtf_zone(mtf_zones, side_str)
                         print(f"{'✅' if mtf_ok else '⚠️ '} MTF zone: {mtf_reason}")
 
-                    # ML gate — predict WIN probability, block low-confidence trades
-                    ml_conf, ml_ok = 0.5, True
-                    ml_features    = None
+                    # ML gate — score only, never blocks signals
+                    ml_conf     = 0.5
+                    ml_features = None
                     if sig != 0 and self.ml_filter:
                         ml_features = self.ml_filter.extract_features(df, sig)
-                        ml_conf, ml_ok = self.ml_filter.predict(ml_features)
-                        if not ml_ok:
-                            print(f"🧠 ML gate blocked {strat_name} {'BUY' if sig==1 else 'SELL'} "
-                                  f"(conf={ml_conf:.0%} < {self.ml_filter.threshold:.0%})")
-                            sig = 0
+                        ml_conf, _ = self.ml_filter.predict(ml_features)
+                        print(f"🧠 ML score {strat_name} {'BUY' if sig==1 else 'SELL'} "
+                              f"conf={ml_conf:.0%}")
 
                     # Execute
                     if not current and sig != 0 and wick != 0.0:
