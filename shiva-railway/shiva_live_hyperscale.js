@@ -246,11 +246,13 @@ async function run() {
         return;
     }
 
-    const priceData = await connection.getSymbolPrice(SYMBOL);
+    const symbolToUse = SYMBOL === 'USOIL' ? 'XTIUSD' : SYMBOL;
+    const priceData = await connection.getSymbolPrice(symbolToUse);
     const price = priceData.bid || priceData.ask;
+    log(`Cycle for ${symbolToUse} @ ${price.toFixed(2)}`);
 
-    // Correct method: getHistoricalCandles is on tradingAccount
-    const history = await tradingAccount.getHistoricalCandles(SYMBOL, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
+    // Some brokers require XTIUSD instead of USOIL for historical data
+    const history = await tradingAccount.getHistoricalCandles(symbolToUse, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
     const candles = history.map(c => ({ open: c.open, high: c.high, low: c.low, close: c.close }));
     const ind = computeIndicators(candles);
 
