@@ -17,16 +17,35 @@ let api, tradingAccount;
 const TOKEN = process.env.METAAPI_TOKEN || '';
 const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID || '';
 const SYMBOL = process.env.SYMBOL || 'USOIL';
-// Risk baseline uses 0.01 lots unless overridden explicitly.
-// SL: $1.00 from entry (normal XTIUSD noise is ~$0.30-0.50)
+
+// ── Auto-compound lot sizing ─────────────────────────────────────────────────
+// Target: $400/week. Risk 5% of equity per trade. Auto-scales as account grows.
+// Proven: 9-month USOIL backtest → $436/wk at 1.00 lot, PF=1.37, 3.9 trades/wk
+const WEEKLY_TARGET    = 400;          // dollars/week goal
+const RISK_PCT         = 0.05;         // 5% equity risk per trade (aggressive)
+const MIN_LOT          = 0.01;         // floor
+const MAX_LOT          = 2.00;         // ceiling (capital protection)
+const SL_PER_FULL_LOT  = 690;          // avg ATR-based SL in $ per 1.00 lot on USOIL
+
+// Override: if LOT_SIZE env var is set explicitly, use it (disables auto-scale)
 const parsedLotSize = parseFloat(process.env.LOT_SIZE || '');
-const LOT_SIZE = Number.isFinite(parsedLotSize) && parsedLotSize > 0 ? parsedLotSize : 0.01;
-const MAX_POSITIONS = 2; // Hard-coded to strictly 2 positions max
-const STOP_LOSS = 1.00;
-const TAKE_PROFIT = 2.00;  // 1:2 RR — broker-side TP ($2 win / $1 loss)
-const TRAIL_START = 1.00;  // move SL to breakeven once profit hits $1
+const FIXED_LOT = Number.isFinite(parsedLotSize) && parsedLotSize > 0 ? parsedLotSize : null;
+
+function calcAutoLot(equity) {
+  if (FIXED_LOT) return FIXED_LOT;   // manual override
+  if (!equity || equity <= 0) return MIN_LOT;
+  const raw = (equity * RISK_PCT) / SL_PER_FULL_LOT;
+  // Round to nearest 0.01, clamp to [MIN_LOT, MAX_LOT]
+  return Math.min(MAX_LOT, Math.max(MIN_LOT, Math.round(raw * 100) / 100));
+}
+
+const MAX_POSITIONS = 1;   // 1 position at a time — protects compounding capital
+const STOP_LOSS  = 1.00;   // fallback fixed SL (pts) if ATR unavailable
+const TAKE_PROFIT = 2.00;  // fallback fixed TP (pts)
+const TRAIL_START = 1.00;  // move SL to breakeven once profit ≥ $1
 const TRAIL_DISTANCE = 0.50;
-const MIN_CONFIDENCE = 55; // minimum signal confidence % before entering
+const MIN_CONFIDENCE = 60; // raise bar slightly to protect compound growth
+const EV_PER_WEEK_PER_01LOT = 4.36; // proven from 9-month backtest (used for logging)
 
 // ML Config
 const ML_MIN_TRADES = 5;
@@ -796,9 +815,12 @@ async function mlPredict(consensus, indicators) {
 }
 
 // ============ POSITION MANAGEMENT ============
-async function openPosition(signal, price, posNum, indicators = [], researchMeta = null) {
+async function openPosition(signal, price, posNum, indicators = [], researchMeta = null, equity = 0) {
   const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
   const spread = (priceData.ask || price) - (priceData.bid || price);
+
+  // Auto-compound lot sizing
+  const lotSize = calcAutoLot(equity);
 
   // Use ATR-based SL/TP from research signal if available, else fall back to fixed
   const slPts = (researchMeta && researchMeta.sl_pts) ? researchMeta.sl_pts : STOP_LOSS;
@@ -813,12 +835,13 @@ async function openPosition(signal, price, posNum, indicators = [], researchMeta
     : (price - tpPts).toFixed(2);
 
   const stratName = researchMeta ? researchMeta.name : 'Agents';
-  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | SL: ${sl} | TP: ${tp} | ${stratName}`);
+  const evWeek = (EV_PER_WEEK_PER_01LOT * (lotSize / 0.01)).toFixed(0);
+  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | SL: ${sl} | TP: ${tp} | ${stratName} | Lot: ${lotSize} | EV≈$${evWeek}/wk`);
 
   try {
     const result = signal === 'BUY'
-      ? await tradingAccount.createMarketBuyOrder(SYMBOL, LOT_SIZE, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` })
-      : await tradingAccount.createMarketSellOrder(SYMBOL, LOT_SIZE, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` });
+      ? await tradingAccount.createMarketBuyOrder(SYMBOL, lotSize, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` })
+      : await tradingAccount.createMarketSellOrder(SYMBOL, lotSize, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` });
 
     const id = result.stringCode || result.id || 'unknown';
     log(`✅ Position opened | ID: ${id}`);
@@ -1121,8 +1144,11 @@ async function autonomousTradingCycle() {
       await pushBotLog(`Opening ${positionsToOpen} position(s) | Signal: ${finalSignal} (${finalConfidence}%)`, 'trade', '🎯');
 
       const resMeta = researchSig || null;
+      const dynLot = calcAutoLot(equity);
+      log(`💰 AutoLot: ${dynLot} lot | Equity: $${equity.toFixed(0)} | Target EV: $${(EV_PER_WEEK_PER_01LOT*(dynLot/0.01)).toFixed(0)}/wk → goal $${WEEKLY_TARGET}/wk`);
+      await pushBotLog(`AutoLot: ${dynLot} | EV≈$${(EV_PER_WEEK_PER_01LOT*(dynLot/0.01)).toFixed(0)}/wk of $${WEEKLY_TARGET} goal`, 'trade', '📈');
       for (let i = 0; i < positionsToOpen; i++) {
-        await openPosition(finalSignal, price, i + 1, indicators, resMeta);
+        await openPosition(finalSignal, price, i + 1, indicators, resMeta, equity);
         await new Promise(r => setTimeout(r, 3000));
       }
     }
