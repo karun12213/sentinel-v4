@@ -21,11 +21,12 @@ const SYMBOL = process.env.SYMBOL || 'USOIL';
 // SL: $1.00 from entry (normal XTIUSD noise is ~$0.30-0.50)
 const parsedLotSize = parseFloat(process.env.LOT_SIZE || '');
 const LOT_SIZE = Number.isFinite(parsedLotSize) && parsedLotSize > 0 ? parsedLotSize : 0.01;
-const parsedMaxPositions = parseInt(process.env.POSITIONS ?? '16', 10);
-const MAX_POSITIONS = Number.isNaN(parsedMaxPositions) ? 16 : parsedMaxPositions;
+const MAX_POSITIONS = 2; // Hard-coded to strictly 2 positions max
 const STOP_LOSS = 1.00;
-const TRAIL_START = 1.00;
+const TAKE_PROFIT = 2.00;  // 1:2 RR — broker-side TP ($2 win / $1 loss)
+const TRAIL_START = 1.00;  // move SL to breakeven once profit hits $1
 const TRAIL_DISTANCE = 0.50;
+const MIN_CONFIDENCE = 55; // minimum signal confidence % before entering
 
 // ML Config
 const ML_MIN_TRADES = 5;
@@ -625,23 +626,22 @@ async function openPosition(signal, price, posNum, indicators = []) {
   const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
   const spread = (priceData.ask || price) - (priceData.bid || price);
   const totalSL = STOP_LOSS + (spread * 2);
-  const sl = signal === 'BUY' ? (price - totalSL).toFixed(2) : (price + totalSL).toFixed(2);
+  const sl = signal === 'BUY'
+    ? (price - totalSL).toFixed(2)
+    : (price + totalSL).toFixed(2);
+  const tp = signal === 'BUY'
+    ? (price + TAKE_PROFIT).toFixed(2)
+    : (price - TAKE_PROFIT).toFixed(2);
 
-  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | SL: ${sl}`);
+  log(`Opening ${posNum}/${MAX_POSITIONS}: ${signal} @ ${price.toFixed(2)} | SL: ${sl} | TP: ${tp} (1:2R)`);
 
   try {
     const result = signal === 'BUY'
-      ? await tradingAccount.createMarketBuyOrder(SYMBOL, LOT_SIZE, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` })
-      : await tradingAccount.createMarketSellOrder(SYMBOL, LOT_SIZE, parseFloat(sl), undefined, { comment: `SHIVA_${posNum}` });
+      ? await tradingAccount.createMarketBuyOrder(SYMBOL, LOT_SIZE, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` })
+      : await tradingAccount.createMarketSellOrder(SYMBOL, LOT_SIZE, parseFloat(sl), parseFloat(tp), { comment: `SHIVA_${posNum}` });
 
     const id = result.stringCode || result.id || 'unknown';
     log(`✅ Position opened | ID: ${id}`);
-
-    // Log trade for ML
-    if (indicators.length > 0) {
-      await logTrade(signal, price, price, 0, indicators, 'open');
-    }
-
     return { id, success: true };
   } catch (e) {
     log(`❌ Position failed: ${e.message}`, 'error');
@@ -667,35 +667,55 @@ async function managePositions(currentPrice) {
         peakData[posKey] = profit;
       }
 
-      // CUT LOSERS (max $3 loss per trade)
+      const side = (pos.type || '').includes('BUY') ? 'BUY' : 'SELL';
+      const entry = parseFloat(pos.openPrice || 0);
+      const curSL = parseFloat(pos.stopLoss || 0);
+
+      // CUT LOSERS (max $3 loss per trade — safety net beyond broker SL)
       if (profit < -3.00) {
         log(`🔴 CUTTING LOSER | ${posKey.slice(0,8)} | PnL: $${profit.toFixed(2)}`, 'error');
         await tradingAccount.closePosition(posKey);
-        await logTrade(pos.type, pos.openPrice || 0, currentPrice, profit, [], 'cut_loss');
+        await logTrade(pos.type, entry, currentPrice, profit, [], 'cut_loss');
         delete peakData[posKey];
         continue;
       }
 
-      // TRAIL WINNERS — aggressive: close if profit drops 30% from peak
-      if (profit >= 1.00 && peak > 0 && profit < peak * 0.70) {
+      // TRAIL WINNERS — Phase 1: move broker SL to breakeven at TRAIL_START profit
+      if (profit >= TRAIL_START && entry > 0 && curSL > 0) {
+        const atBE = side === 'BUY' ? curSL >= entry : curSL <= entry;
+        if (!atBE) {
+          const newSL = side === 'BUY'
+            ? (entry + 0.01).toFixed(2)
+            : (entry - 0.01).toFixed(2);
+          try {
+            await tradingAccount.modifyPosition(posKey, { stopLoss: parseFloat(newSL) });
+            log(`✅ BREAKEVEN: ${side} ${posKey.slice(0,8)} SL ${curSL.toFixed(2)} → ${newSL} (profit=$${profit.toFixed(2)})`);
+          } catch (e) {
+            log(`⚠️ BE modify error: ${e.message}`, 'error');
+          }
+        }
+      }
+
+      // TRAIL WINNERS — Phase 2: close if profit drops 30% from peak once peak > $2
+      if (profit >= 1.00 && peak >= 2.00 && profit < peak * 0.70) {
         log(`🟢 TRAILING TP | ${posKey.slice(0,8)} | Peak: $${peak.toFixed(2)} → Now: $${profit.toFixed(2)} (gave back 30%)`, 'success');
         await tradingAccount.closePosition(posKey);
-        await logTrade(pos.type, pos.openPrice || 0, currentPrice, profit, [], 'take_profit');
+        await logTrade(pos.type, entry, currentPrice, profit, [], 'take_profit');
         delete peakData[posKey];
         continue;
       }
 
-      // HARD TAKE PROFIT at $6 per trade
-      if (profit >= 6.00) {
+      // HARD TAKE PROFIT at $4 per trade (runner extension above broker TP)
+      if (profit >= 4.00) {
         log(`🟢 TAKE PROFIT | ${posKey.slice(0,8)} | PnL: +$${profit.toFixed(2)}`, 'success');
         await tradingAccount.closePosition(posKey);
-        await logTrade(pos.type, pos.openPrice || 0, currentPrice, profit, [], 'take_profit');
+        await logTrade(pos.type, entry, currentPrice, profit, [], 'take_profit');
         delete peakData[posKey];
         continue;
       }
 
       if (profit >= 0.30) {
-        log(`🟢 HOLDING | ${posKey.slice(0,8)} | PnL: +$${profit.toFixed(2)} | Peak: $${peakData[posKey]?.toFixed(2) || profit.toFixed(2)}`);
+        log(`🟢 HOLDING | ${posKey.slice(0,8)} | PnL: +$${profit.toFixed(2)} | Peak: $${(peakData[posKey] || profit).toFixed(2)}`);
       }
     }
 
@@ -732,23 +752,43 @@ async function autonomousTradingCycle() {
     const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
     const price = priceData.bid || priceData.ask;
 
-    // Build candles from real price data
-    const candles = [];
-    const basePrice = price;
-    for (let i = 0; i < 50; i++) {
-      // Use actual spread and volatility patterns
+    // Build candles from REAL historical data (not synthetic noise)
+    let candles = [];
+    try {
+      // Fetch real 15-minute candles from MetaApi
+      const now = new Date();
+      const startTime = new Date(now.getTime() - 50 * 15 * 60 * 1000); // ~12.5 hours back
+      const historicalCandles = await tradingAccount.getHistoricalCandles(SYMBOL, '15m', startTime, now);
+
+      if (historicalCandles && historicalCandles.length >= 10) {
+        candles = historicalCandles.map(c => ({
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: c.tickVolume || c.volume || 100
+        }));
+        log(`📊 Using ${candles.length} real 15m candles`);
+      } else {
+        throw new Error(`Only ${historicalCandles?.length || 0} candles returned`);
+      }
+    } catch (candleErr) {
+      log(`⚠️ Historical candle fetch failed: ${candleErr.message} — using price-derived fallback`, 'error');
+      // Fallback: use spread-based synthetic candles (better than pure random)
       const spread = (priceData.ask - priceData.bid) || 0.05;
       const volatility = spread * (3 + Math.random() * 2);
-      const trend = Math.sin(i / 10) * volatility * 2;
-      const open = basePrice + trend + (Math.random() - 0.5) * volatility;
-      const close = open + (Math.random() - 0.5) * volatility * 2;
-      candles.push({
-        open,
-        high: Math.max(open, close) + Math.random() * volatility,
-        low: Math.min(open, close) - Math.random() * volatility,
-        close,
-        volume: 100 + Math.random() * 900
-      });
+      for (let i = 0; i < 50; i++) {
+        const trend = Math.sin(i / 10) * volatility * 2;
+        const open = price + trend + (Math.random() - 0.5) * volatility;
+        const close = open + (Math.random() - 0.5) * volatility * 2;
+        candles.push({
+          open,
+          high: Math.max(open, close) + Math.random() * volatility,
+          low: Math.min(open, close) - Math.random() * volatility,
+          close,
+          volume: 100 + Math.random() * 900
+        });
+      }
     }
 
     // Run 40 agents
@@ -794,8 +834,18 @@ async function autonomousTradingCycle() {
       finalConfidence
     }));
 
-    // Manage existing positions
+    // Manage existing positions first (always — regardless of session)
     const { livePositions, myPositions } = await managePositions(price);
+
+    // ICT Session filter — only open NEW entries during London and NY sessions
+    const utcHour = new Date().getUTCHours();
+    const inLondon = utcHour >= 7 && utcHour <= 12;
+    const inNY     = utcHour >= 13 && utcHour <= 17;
+    if (!inLondon && !inNY) {
+      log(`⏰ Outside ICT session (UTC ${utcHour}h) — managing positions only, no new entries`);
+      await pushBotLog(`Outside session (UTC ${utcHour}h) — no new entries`, 'info', '⏰');
+      return { success: true, signal: 'HOLD', reason: 'outside_session', cycle: cycleCount };
+    }
 
     // Get live positions and save to Redis
     const currentPositions = myPositions.length > 0
@@ -811,9 +861,10 @@ async function autonomousTradingCycle() {
     }));
     await redis.set(KEYS.POSITIONS, JSON.stringify(positionData));
 
-    if (finalSignal === 'HOLD') {
-      log(`Signal: HOLD - No trades`);
-      await pushBotLog(`Signal: HOLD (${finalConfidence}%) - no trade`, 'info', '⏸️');
+    if (finalSignal === 'HOLD' || finalConfidence < MIN_CONFIDENCE) {
+      const reason = finalSignal === 'HOLD' ? 'HOLD' : `low confidence (${finalConfidence}% < ${MIN_CONFIDENCE}%)`;
+      log(`Signal: ${reason} - No trades`);
+      await pushBotLog(`Signal: ${reason} - no trade`, 'info', '⏸️');
       return { success: true, signal: 'HOLD', cycle: cycleCount };
     }
 
@@ -821,6 +872,17 @@ async function autonomousTradingCycle() {
       log(`Max positions reached (${currentPositions.length}/${MAX_POSITIONS})`);
       await pushBotLog(`Max positions reached (${currentPositions.length}/${MAX_POSITIONS})`, 'info', '📌');
       return { success: true, signal: finalSignal, reason: 'Max positions' };
+    }
+
+    // ENFORCE SAME DIRECTION RULE
+    if (currentPositions.length > 0) {
+      const activeType = currentPositions[0].type || '';
+      const activeDirection = activeType.includes('BUY') ? 'BUY' : 'SELL';
+      if (finalSignal !== activeDirection) {
+        log(`Skipping trade: Signal is ${finalSignal} but active trades are ${activeDirection}`);
+        await pushBotLog(`Skipping trade: Signal conflicts with active trades (${activeDirection})`, 'info', '⏸️');
+        return { success: true, signal: finalSignal, reason: 'Conflict with active direction' };
+      }
     }
 
     // Open positions — max 2 per cycle to avoid overexposure
