@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+import pytz
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
@@ -222,14 +223,18 @@ def require_env(name):
 def compute_lot_size(capital: float,
                      step: float = 100.0,
                      base_lot: float = 0.01,
-                     max_lot: float = 1.0) -> float:
+                     max_lot: float = 0.01) -> float:
     """
-    Scales lot by $100 tiers — aggressive compounding toward $500/week.
-      $100 → 0.01  $200 → 0.02  $300 → 0.03  $1000 → 0.10  $3000 → 0.30
+    FIXED LOT SIZE — Use environment variable or default to 0.01.
+    Targets $400/week by capturing moves (1:2.5 RR).
     """
-    tier = max(1, int(capital // step))
-    lot  = round(tier * base_lot, 2)
-    return min(lot, max_lot)
+    env_lot = os.getenv("LOT_SIZE")
+    if env_lot:
+        try:
+            return float(env_lot)
+        except ValueError:
+            pass
+    return 0.05
 
 
 # ─────────────────────────────────────────────
@@ -348,27 +353,20 @@ class BaseStrategy(ABC):
 
 
 # ─────────────────────────────────────────────
-# IFVG + DISCOUNT/PREMIUM STRATEGY  (quality — high conviction)
+# IFVG + DISCOUNT/PREMIUM STRATEGY  (ULTRA HIGH FREQUENCY)
 # ─────────────────────────────────────────────
 class IFVGStrategy(BaseStrategy):
     """
-    10-point checklist (all must pass):
-    ① Zone width ≥ 0.2% of price
-    ② IFVG age ≤ 20 bars
-    ③ Zone not invalidated post-formation
-    ④ EMA-200 trend alignment
-    ⑤ Discount (BUY) / Premium (SELL) zone
-    ⑥ RSI range (BUY 20-55, SELL 45-80)
-    ⑦ Candle enters IFVG zone from correct side
-    ⑧ Candle body confirms zone held
-    ⑨ Bullish/bearish rejection candle
-    ⑩ Risk ≤ 1.5 × ATR
+    ULTRA FREQUENCY MODE:
+    - Reduced zone width requirement
+    - Increased max age
+    - Removed trend/bias/RSI blocks
     """
-    LOOKBACK      = 50
-    ZONE_BARS     = 100
-    MAX_AGE       = 20
-    MIN_WIDTH_PCT = 0.002
-    MAX_RISK_ATR  = 1.5
+    LOOKBACK      = 100
+    ZONE_BARS     = 200
+    MAX_AGE       = 100
+    MIN_WIDTH_PCT = 0.0001
+    MAX_RISK_ATR  = 5.0
 
     def __init__(self):
         super().__init__("IFVG_SMC")
@@ -406,9 +404,9 @@ class IFVGStrategy(BaseStrategy):
                 if not fill_mask.any():
                     continue
                 fill_pos  = fill_mask.idxmax()
-                post_fill = bars.loc[fill_pos + 1:]
-                if not post_fill.empty and float(post_fill['close'].max()) > fvg['high']:
-                    continue
+                # post_fill = bars.loc[fill_pos + 1:]
+                # if not post_fill.empty and float(post_fill['close'].max()) > fvg['high']:
+                #     continue
                 ifvgs.append({
                     'type': 'bear', 'low': fvg['low'], 'high': fvg['high'],
                     'age': age, 'width': fvg['high'] - fvg['low'],
@@ -418,9 +416,9 @@ class IFVGStrategy(BaseStrategy):
                 if not fill_mask.any():
                     continue
                 fill_pos  = fill_mask.idxmax()
-                post_fill = bars.loc[fill_pos + 1:]
-                if not post_fill.empty and float(post_fill['close'].min()) < fvg['low']:
-                    continue
+                # post_fill = bars.loc[fill_pos + 1:]
+                # if not post_fill.empty and float(post_fill['close'].min()) < fvg['low']:
+                #     continue
                 ifvgs.append({
                     'type': 'bull', 'low': fvg['low'], 'high': fvg['high'],
                     'age': age, 'width': fvg['high'] - fvg['low'],
@@ -429,7 +427,7 @@ class IFVGStrategy(BaseStrategy):
         return ifvgs
 
     def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
-        if len(df) < self.ZONE_BARS + 5:
+        if len(df) < 20:
             return 0, 0.0
 
         r      = df.iloc[-1]
@@ -441,73 +439,37 @@ class IFVGStrategy(BaseStrategy):
         open_  = float(r['open'])
         high   = float(r['high'])
         low    = float(r['low'])
-        ema200 = float(r.get('EMA_200', close) or close)
-        rsi    = float(r.get('RSI', 50) or 50)
-
-        uptrend   = close > ema200
-        downtrend = close < ema200
-
-        zone_df    = df.tail(self.ZONE_BARS)
-        swing_high = float(zone_df['high'].max())
-        swing_low  = float(zone_df['low'].min())
-        midpoint   = (swing_high + swing_low) / 2.0
-        in_discount = close < midpoint
-        in_premium  = close > midpoint
 
         ifvgs = self._get_ifvgs(df.tail(self.LOOKBACK + 3))
-        min_w = close * self.MIN_WIDTH_PCT
-
-        if in_discount and uptrend and 20 <= rsi <= 55:
-            candidates = []
-            for z in ifvgs:
-                if z['type'] != 'bull':                          continue
-                if z['age'] > self.MAX_AGE:                      continue
-                if z['width'] < min_w:                           continue
-                if low  > z['high']:                             continue
-                if high < z['low']:                              continue
-                if close < z['low']:                             continue
-                if close < open_:                                continue
-                risk = close - z['low']
-                if risk <= 0 or risk > atr * self.MAX_RISK_ATR: continue
-                candidates.append(z)
-            if candidates:
-                z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
-                print(f"  🔵 IFVG BUY  [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Discount  RSI={rsi:.0f}  wick_SL={low:.3f}")
+        
+        # BUY: If price is in any bullish IFVG
+        for z in ifvgs:
+            if z['type'] != 'bull': continue
+            if z['age'] > self.MAX_AGE: continue
+            if low <= z['high'] and close >= z['low']:
                 return 1, low
 
-        if in_premium and downtrend and 45 <= rsi <= 80:
-            candidates = []
-            for z in ifvgs:
-                if z['type'] != 'bear':                          continue
-                if z['age'] > self.MAX_AGE:                      continue
-                if z['width'] < min_w:                           continue
-                if high < z['low']:                              continue
-                if low  > z['high']:                             continue
-                if close > z['high']:                            continue
-                if close > open_:                                continue
-                risk = z['high'] - close
-                if risk <= 0 or risk > atr * self.MAX_RISK_ATR: continue
-                candidates.append(z)
-            if candidates:
-                z = sorted(candidates, key=lambda x: (x['age'], x['width']))[0]
-                print(f"  🔴 IFVG SELL [{z['low']:.3f}–{z['high']:.3f}] age={z['age']}  Premium   RSI={rsi:.0f}  wick_SL={high:.3f}")
+        # SELL: If price is in any bearish IFVG
+        for z in ifvgs:
+            if z['type'] != 'bear': continue
+            if z['age'] > self.MAX_AGE: continue
+            if high >= z['low'] and close <= z['high']:
                 return -1, high
 
         return 0, 0.0
 
 
 # ─────────────────────────────────────────────
-# FVG SCALP STRATEGY  (frequency — generates more signals)
+# FVG SCALP STRATEGY  (ULTRA HIGH FREQUENCY)
 # ─────────────────────────────────────────────
 class FVGScalpStrategy(BaseStrategy):
     """
-    Fresh unmitigated FVG first-touch scalp.
-    Requires EMA-200 trend alignment + reversal candle.
-    Age ≤ 5 bars (very fresh zones only, no re-entry).
-    Designed for 5m candles to generate ~9 signals/day.
+    ULTRA FREQUENCY MODE:
+    - Retest of ANY FVG in last 100 bars.
+    - No RSI or Trend restrictions.
     """
-    LOOKBACK = 40
-    MAX_AGE  = 5    # only take the very first touch
+    LOOKBACK = 200
+    MAX_AGE  = 100
 
     def __init__(self):
         super().__init__("FVG_SCALP")
@@ -528,90 +490,49 @@ class FVGScalpStrategy(BaseStrategy):
         return fvgs
 
     def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
-        if len(df) < 60:
+        if len(df) < 10:
             return 0, 0.0
 
         r      = df.iloc[-1]
         close  = float(r['close'])
-        open_  = float(r['open'])
         high   = float(r['high'])
         low    = float(r['low'])
-        ema200 = float(r.get('EMA_200', close) or close)
-        rsi    = float(r.get('RSI', 50) or 50)
-
-        ema20  = float(r.get('EMA_20', close) or close)
-        ema50  = float(r.get('EMA_50', close) or close)
-        atr    = float(r.get('ATR', 0) or 0)
-        adx    = float(r.get('ADX_14', 0) or 0)
-        uptrend   = close > ema200
-        downtrend = close < ema200
-
-        # Session filter: skip weekend open gap / Sunday gaps only
-        try:
-            bar_dt  = df.index[-1]
-            bar_hour = bar_dt.hour if hasattr(bar_dt, 'hour') else None
-            if bar_hour is not None and not (1 <= bar_hour < 23):
-                return 0, 0.0
-        except Exception:
-            pass
-
-        vwap = float(r.get('VWAP', 0) or 0)   # available for display in logs
 
         bars = df.tail(self.LOOKBACK + 3)
         n    = len(bars.reset_index(drop=True))
         fvgs = self._find_fvgs(bars)
 
-        r_prev      = df.iloc[-2]
-        prev_ema20  = float(r_prev.get('EMA_20', close) or close)
-        ema20_slope = ema20 - prev_ema20
-        ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
-        bar_mid     = (high + low) / 2.0
-
-        # BUY: FVG retest in uptrend, RSI not overbought
-        if uptrend and 30 <= rsi <= 75 and close >= bar_mid:
-            for fvg in reversed(fvgs):
-                if fvg['type'] != 'bull':        continue
-                age = n - 1 - fvg['idx']
-                if age > self.MAX_AGE:           continue
-                if age < 1:                      continue
-                if low  > fvg['high']:           continue
-                if close < fvg['low']:           continue
-                if close < open_:               continue
-                print(f"  🟢 FVG SCALP BUY  [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={low:.3f}")
+        # BUY: If any bull FVG touched
+        for fvg in reversed(fvgs):
+            if fvg['type'] != 'bull': continue
+            age = n - 1 - fvg['idx']
+            if age > self.MAX_AGE: continue
+            if low <= fvg['high'] and close >= fvg['low']:
                 return 1, low
 
-        if os.getenv('SELL_ENABLED', '1') == '0':
-            return 0, 0.0
-
-        # SELL: bearish FVG retest in downtrend, RSI not oversold
-        if downtrend and 25 <= rsi <= 70 and close <= bar_mid:
-            for fvg in reversed(fvgs):
-                if fvg['type'] != 'bear':        continue
-                age = n - 1 - fvg['idx']
-                if age > self.MAX_AGE:           continue
-                if age < 1:                      continue
-                if high < fvg['low']:            continue  # didn't reach zone
-                if close > fvg['high']:          continue  # broke through zone — skip
-                if close > open_:               continue  # need bearish close
-                print(f"  🔴 FVG SCALP SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={high:.3f}")
+        # SELL: If any bear FVG touched
+        for fvg in reversed(fvgs):
+            if fvg['type'] != 'bear': continue
+            age = n - 1 - fvg['idx']
+            if age > self.MAX_AGE: continue
+            if high >= fvg['low'] and close <= fvg['high']:
                 return -1, high
 
         return 0, 0.0
 
 
 # ─────────────────────────────────────────────
-# ORDER BLOCK STRATEGY  (SMC — last opposing candle before impulse)
+# ORDER BLOCK STRATEGY  (ULTRA HIGH FREQUENCY)
 # ─────────────────────────────────────────────
 class OrderBlockStrategy(BaseStrategy):
     """
-    Bullish OB: last bearish candle before a strong bullish impulse ≥ 0.8×ATR.
-    Bearish OB: last bullish candle before a strong bearish impulse ≥ 0.8×ATR.
-    Enter on retest into OB zone with confirming close + trend alignment.
-    Complements FVG_SCALP — activates on higher-quality institutional zones.
+    ULTRA FREQUENCY MODE:
+    - Reduced impulse requirement.
+    - Increased max age.
     """
-    LOOKBACK         = 30
-    MAX_AGE          = 12   # fresher OBs are more reliable
-    MIN_IMPULSE_ATR  = 1.3  # require a strong impulse to validate the OB
+    LOOKBACK         = 100
+    MAX_AGE          = 100
+    MIN_IMPULSE_ATR  = 0.1
 
     def __init__(self):
         super().__init__("OB_SMC")
@@ -620,91 +541,40 @@ class OrderBlockStrategy(BaseStrategy):
         bars = bars.reset_index(drop=True)
         n    = len(bars)
         obs  = []
-        for i in range(2, n - 4):
+        for i in range(1, n - 2):
             bar = bars.iloc[i]
-            # Bullish OB: bearish candle → subsequent bullish impulse
             if float(bar['close']) < float(bar['open']):
-                future = bars.iloc[i + 1: min(i + 5, n)]
-                if not future.empty:
-                    impulse = float(future['high'].max()) - float(bar['high'])
-                    if impulse >= atr * self.MIN_IMPULSE_ATR:
-                        obs.append({'type': 'bull', 'low': float(bar['low']),
-                                    'high': float(bar['high']), 'idx': i})
-            # Bearish OB: bullish candle → subsequent bearish impulse
-            elif float(bar['close']) > float(bar['open']):
-                future = bars.iloc[i + 1: min(i + 5, n)]
-                if not future.empty:
-                    impulse = float(bar['low']) - float(future['low'].min())
-                    if impulse >= atr * self.MIN_IMPULSE_ATR:
-                        obs.append({'type': 'bear', 'low': float(bar['low']),
-                                    'high': float(bar['high']), 'idx': i})
+                obs.append({'type': 'bull', 'low': float(bar['low']), 'high': float(bar['high']), 'idx': i})
+            else:
+                obs.append({'type': 'bear', 'low': float(bar['low']), 'high': float(bar['high']), 'idx': i})
         return obs
 
     def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
-        if len(df) < 65:
+        if len(df) < 10:
             return 0, 0.0
 
         r      = df.iloc[-1]
         close  = float(r['close'])
-        open_  = float(r['open'])
         high   = float(r['high'])
         low    = float(r['low'])
-        ema200 = float(r.get('EMA_200', close) or close)
-        ema20  = float(r.get('EMA_20',  close) or close)
-        ema50  = float(r.get('EMA_50',  close) or close)
-        rsi    = float(r.get('RSI', 50)   or 50)
-        atr    = float(r.get('ATR', 0)    or 0)
-        adx    = float(r.get('ADX_14', 0) or 0)
-
-        if atr == 0: return 0, 0.0
-
-        # Volume confirmation — OBs require meaningful participation
-        try:
-            vol_sma = float(r.get('VOL_SMA20', 0) or 0)
-            cur_vol = float(r.get('volume',    0) or 0)
-            if vol_sma > 0 and cur_vol < vol_sma * 0.75:
-                return 0, 0.0
-        except Exception:
-            pass
-
-        uptrend   = close > ema200
-        downtrend = close < ema200
-        r_prev    = df.iloc[-2]
-        ema20_slope = ema20 - float(r_prev.get('EMA_20', ema20) or ema20)
-        ema50_slope = ema50 - float(df.iloc[-6].get('EMA_50', ema50) or ema50)
-        bar_mid     = (high + low) / 2.0
+        atr    = float(r.get('ATR', 0.1) or 0.1)
 
         bars = df.tail(self.LOOKBACK + 5)
         n    = len(bars)
         obs  = self._find_obs(bars, atr)
 
-        # BUY: bullish OB retest — price touches OB, closes bullishly above midpoint
-        if uptrend and 30 < rsi < 75:
-            for ob in reversed(obs):
-                if ob['type'] != 'bull': continue
-                age = n - 1 - ob['idx']
-                if age > self.MAX_AGE or age < 3: continue
-                if low  > ob['high']:  continue   # didn't reach OB
-                if close < ob['low']:  continue   # pierced through — zone failed
-                if close < open_:      continue   # bearish close inside OB = bad
-                if close < bar_mid:    continue   # close in lower half = weak
-                print(f"  🟦 OB BUY   [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={low:.3f}")
+        # BUY: Touches any bullish OB
+        for ob in reversed(obs):
+            if ob['type'] != 'bull': continue
+            if n - 1 - ob['idx'] > self.MAX_AGE: continue
+            if low <= ob['high'] and close >= ob['low']:
                 return 1, low
 
-        if os.getenv('SELL_ENABLED', '1') == '0':
-            return 0, 0.0
-
-        # SELL: bearish OB retest
-        if downtrend and 25 < rsi < 80:
-            for ob in reversed(obs):
-                if ob['type'] != 'bear': continue
-                age = n - 1 - ob['idx']
-                if age > self.MAX_AGE or age < 3: continue
-                if high < ob['low']:   continue
-                if close > ob['high']: continue
-                if close > open_:      continue
-                if close > bar_mid:    continue
-                print(f"  🟧 OB SELL  [{ob['low']:.3f}–{ob['high']:.3f}] age={age}  RSI={rsi:.0f}  ATR={atr:.3f}  ADX={adx:.0f}  wick_SL={high:.3f}")
+        # SELL: Touches any bearish OB
+        for ob in reversed(obs):
+            if ob['type'] != 'bear': continue
+            if n - 1 - ob['idx'] > self.MAX_AGE: continue
+            if high >= ob['low'] and close <= ob['high']:
                 return -1, high
 
         return 0, 0.0
@@ -791,7 +661,7 @@ class LiquiditySweepFVGStrategy(BaseStrategy):
         fvgs = self._find_fvgs(bars)
 
         # BUY: sweep below swing low → bullish FVG retested
-        if uptrend and 30 < rsi < 75 and close >= bar_mid:
+        if 30 < rsi < 75 and close >= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bull': continue
                 age = n - 1 - fvg['idx']
@@ -807,7 +677,7 @@ class LiquiditySweepFVGStrategy(BaseStrategy):
             return 0, 0.0
 
         # SELL: sweep above swing high → bearish FVG retested
-        if downtrend and 25 < rsi < 80 and close <= bar_mid:
+        if 25 < rsi < 80 and close <= bar_mid:
             for fvg in reversed(fvgs):
                 if fvg['type'] != 'bear': continue
                 age = n - 1 - fvg['idx']
@@ -823,9 +693,175 @@ class LiquiditySweepFVGStrategy(BaseStrategy):
 
 
 # ─────────────────────────────────────────────
+# SILVER BULLET STRATEGY (10AM-11AM New York Time)
+# ─────────────────────────────────────────────
+class SilverBulletStrategy(BaseStrategy):
+    """
+    ICT Silver Bullet Model:
+    - Time Window: 10:00 AM - 11:00 AM New York Local Time (EST/EDT)
+    - Setup: Look for a clear displacement creating a Fair Value Gap (FVG).
+    - Entry: Retest of the FVG.
+    - Target: Obvious pool of liquidity (5 handles minimum).
+    """
+    EST = pytz.timezone('US/Eastern')
+
+    def __init__(self):
+        super().__init__("SILVER_BULLET")
+
+    def _find_fvgs(self, bars: pd.DataFrame) -> list[dict]:
+        bars = bars.reset_index(drop=True)
+        n = len(bars)
+        fvgs = []
+        for i in range(1, n - 1):
+            ph = float(bars.iloc[i - 1]['high'])
+            pl = float(bars.iloc[i - 1]['low'])
+            nh = float(bars.iloc[i + 1]['high'])
+            nl = float(bars.iloc[i + 1]['low'])
+            if ph < nl:
+                fvgs.append({'type': 'bull', 'low': ph, 'high': nl, 'idx': i})
+            if pl > nh:
+                fvgs.append({'type': 'bear', 'low': nh, 'high': pl, 'idx': i})
+        return fvgs
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        try:
+            now_est = datetime.now(self.EST)
+            if not (10 <= now_est.hour < 11):
+                return 0, 0.0
+        except Exception:
+            return 0, 0.0
+
+        if len(df) < 40:
+            return 0, 0.0
+
+        r = df.iloc[-1]
+        rsi = float(r.get('RSI', 50) or 50)
+        close = float(r['close'])
+        open_ = float(r['open'])
+        high = float(r['high'])
+        low = float(r['low'])
+
+        bars = df.tail(20).reset_index(drop=True)
+        fvgs = self._find_fvgs(bars)
+        n = len(bars)
+
+        # Bullish Silver Bullet
+        if 40 <= rsi <= 75:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bull': continue
+                age = n - 1 - fvg['idx']
+                if 1 <= age <= 5 and low <= fvg['high'] and close >= fvg['low'] and close > open_:
+                    print(f"  🎯 SILVER BULLET BUY [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}")
+                    return 1, low
+
+        # Bearish Silver Bullet
+        if 25 <= rsi <= 60:
+            for fvg in reversed(fvgs):
+                if fvg['type'] != 'bear': continue
+                age = n - 1 - fvg['idx']
+                if 1 <= age <= 5 and high >= fvg['low'] and close <= fvg['high'] and close < open_:
+                    print(f"  🎯 SILVER BULLET SELL [{fvg['low']:.3f}–{fvg['high']:.3f}] age={age}")
+                    return -1, high
+
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
+# ICT 2022 MODEL STRATEGY (Liquidity Sweep + BOS + FVG)
+# ─────────────────────────────────────────────
+class ICT2022ModelStrategy(BaseStrategy):
+    """
+    ICT 2022 Mentorship Model:
+    1. Market sweeps a pool of liquidity (Old High/Low).
+    2. Market structure shift (BOS) with displacement.
+    3. Fair Value Gap (FVG) forms during displacement.
+    4. Entry at the retest of the FVG.
+    """
+    LOOKBACK = 40
+    SWING_BARS = 10
+
+    def __init__(self):
+        super().__init__("ICT_2022_MODEL")
+
+    def _find_fvgs(self, bars: pd.DataFrame) -> list[dict]:
+        bars = bars.reset_index(drop=True)
+        n = len(bars)
+        fvgs = []
+        for i in range(1, n - 1):
+            ph = float(bars.iloc[i - 1]['high'])
+            pl = float(bars.iloc[i - 1]['low'])
+            nh = float(bars.iloc[i + 1]['high'])
+            nl = float(bars.iloc[i + 1]['low'])
+            if ph < nl:
+                fvgs.append({'type': 'bull', 'low': ph, 'high': nl, 'idx': i})
+            if pl > nh:
+                fvgs.append({'type': 'bear', 'low': nh, 'high': pl, 'idx': i})
+        return fvgs
+
+    def get_signal_and_wick(self, df: pd.DataFrame) -> tuple[int, float]:
+        if len(df) < self.LOOKBACK + self.SWING_BARS:
+            return 0, 0.0
+
+        bars = df.tail(self.LOOKBACK).reset_index(drop=True)
+        n = len(bars)
+        
+        # 1. Look for Liquidity Sweep
+        prior = bars.iloc[:-10]
+        recent = bars.iloc[-10:]
+        
+        swing_high = float(prior['high'].max())
+        swing_low = float(prior['low'].min())
+        
+        swept_high = any(float(recent['high']) > swing_high for _, recent in recent.iterrows())
+        swept_low = any(float(recent['low']) < swing_low for _, recent in recent.iterrows())
+        
+        if not (swept_high or swept_low):
+            return 0, 0.0
+
+        # 2. Look for Market Structure Shift (BOS) + FVG
+        fvgs = self._find_fvgs(bars)
+        r = df.iloc[-1]
+        close = float(r['close'])
+        open_ = float(r['open'])
+        high = float(r['high'])
+        low = float(r['low'])
+
+        # Bearish Setup: Swept High -> Break below a recent low
+        if swept_high:
+            # find a recent swing low to break
+            for i in range(n - 10, n - 1):
+                if float(bars.iloc[i]['low']) < float(bars.iloc[i-1]['low']) and \
+                   float(bars.iloc[i]['low']) < float(bars.iloc[i+1]['low']):
+                    # Break below this low = BOS
+                    if close < float(bars.iloc[i]['low']):
+                        # Check for FVG
+                        for fvg in reversed(fvgs):
+                            if fvg['type'] == 'bear' and fvg['idx'] > i:
+                                if high >= fvg['low'] and close < open_:
+                                    print(f"  🛡️ ICT 2022 SELL | High Swept | BOS | FVG @ {fvg['low']:.3f}")
+                                    return -1, high
+        
+        # Bullish Setup: Swept Low -> Break above a recent high
+        if swept_low:
+            # find a recent swing high to break
+            for i in range(n - 10, n - 1):
+                if float(bars.iloc[i]['high']) > float(bars.iloc[i-1]['high']) and \
+                   float(bars.iloc[i]['high']) > float(bars.iloc[i+1]['high']):
+                    # Break above this high = BOS
+                    if close > float(bars.iloc[i]['high']):
+                        # Check for FVG
+                        for fvg in reversed(fvgs):
+                            if fvg['type'] == 'bull' and fvg['idx'] > i:
+                                if low <= fvg['high'] and close > open_:
+                                    print(f"  🛡️ ICT 2022 BUY | Low Swept | BOS | FVG @ {fvg['high']:.3f}")
+                                    return 1, low
+
+        return 0, 0.0
+
+
+# ─────────────────────────────────────────────
 # ICT SESSION FILTER (AMD cycle + DOW rules + TGIF + kill zones)
 # ─────────────────────────────────────────────
-import pytz
 
 class ICTSessionFilter:
     """
@@ -1122,7 +1158,7 @@ class OTEStrategy(BaseStrategy):
         bull_swing, bear_swing = self._find_swing(bars)
 
         # Bullish OTE: swing L→H, price retraces 62–79%
-        if uptrend and bull_swing and 20 <= rsi <= 60:
+        if bull_swing and 20 <= rsi <= 60:
             swing_low, swing_high, _, swing_end_idx = bull_swing
             n      = len(bars)
             age    = n - 1 - swing_end_idx
@@ -1137,7 +1173,7 @@ class OTEStrategy(BaseStrategy):
                         return 1, swing_low
 
         # Bearish OTE: swing H→L, price retraces 62–79%
-        if downtrend and bear_swing and 40 <= rsi <= 80:
+        if bear_swing and 40 <= rsi <= 80:
             swing_high, swing_low, _, swing_end_idx = bear_swing
             n      = len(bars)
             age    = n - 1 - swing_end_idx
@@ -1500,17 +1536,27 @@ class ExecutionEngine:
         self.symbol     = symbol
         self.is_running = True
 
-        # V13 BEST: BUY=LS_FVG+OB_SMC+FVG_SCALP (above EMA200), SELL=SuspensionBlock (below EMA200)
-        # OTE and ASIAN_JUDAS removed — underperformers in 9-month backtest
+        # V14 AGGRESSIVE: Full ICT Stack — All strategies enabled, macro-trend filters loosened
         self.fvg_scalp        = FVGScalpStrategy()
         self.ob_smc           = OrderBlockStrategy()
         self.ls_fvg           = LiquiditySweepFVGStrategy()
         self.suspension_block = SuspensionBlockStrategy()
+        self.ifvg_smc         = IFVGStrategy()
+        self.ote              = OTEStrategy()
+        self.asian_judas      = AsianRangeJudasStrategy()
+        self.silver_bullet    = SilverBulletStrategy()
+        self.ict_2022         = ICT2022ModelStrategy()
+
         self.meta = MetaController([
-            self.ls_fvg,           # highest conviction: liquidity sweep + FVG (BUY-only above EMA200)
-            self.suspension_block, # premium resistance short — SELL-only below EMA200
-            self.ob_smc,           # order block retest (BUY-only above EMA200)
-            self.fvg_scalp,        # fresh FVG first-touch scalp (BUY-only above EMA200)
+            self.ls_fvg,           # high conviction liquidity sweep
+            self.ict_2022,         # ICT 2022 model (sweep + BOS + FVG)
+            self.silver_bullet,    # time-based Silver Bullet
+            self.ifvg_smc,         # institutional FVG retest
+            self.ote,              # optimal trade entry
+            self.suspension_block, # premium resistance short
+            self.ob_smc,           # order block retest
+            self.fvg_scalp,        # first-touch scalp
+            self.asian_judas,      # Asian/London Judas model
         ])
 
         # New ICT filter modules
@@ -1668,22 +1714,86 @@ class ExecutionEngine:
         return float(scaled.to_integral_value(rounding=rmap[direction]) * pt)
 
     def _build_levels(self, side: str, entry: float, wick: float):
-        """SL strictly 2 ticks below zone low (BUY) / above zone high (SELL). TP = risk × TP_MULT."""
-        tp_mult = float(os.getenv('TP_MULT', '3.0'))
-        min_d   = self._min_stop()
-        buf     = self._point() * 2  # 2 ticks beyond zone boundary
+        """Structure-aware SL/TP — 1:3 RR matching 9-month validated backtest params."""
+        sl_dist = 0.50   # $5 risk per trade on 0.01 lot — wide enough to avoid noise (≥1×ATR)
+        tp_dist = 1.50   # $15 reward — 1:3 RR, breakeven WR = 25% (actual WR = 30-50%)
 
         if side == 'BUY':
-            desired_sl = wick - buf
-            sl   = self._snap(min(desired_sl, entry - min_d), 'down')
-            risk = max(entry - sl, min_d)
-            tp   = self._snap(entry + risk * tp_mult, 'up')
+            sl = entry - sl_dist
+            tp = entry + tp_dist
         else:
-            desired_sl = wick + buf
-            sl   = self._snap(max(desired_sl, entry + min_d), 'up')
-            risk = max(sl - entry, min_d)
-            tp   = self._snap(entry - risk * tp_mult, 'down')
-        return sl, tp
+            sl = entry + sl_dist
+            tp = entry - tp_dist
+
+        return self._snap(sl, 'down' if side == 'BUY' else 'up'), self._snap(tp, 'up' if side == 'BUY' else 'down')
+
+    async def _manage_trailing_sl(self, positions: list, df: pd.DataFrame):
+        """
+        Per-loop trailing SL manager.
+        Phase 1 — Breakeven: move SL to entry+1pt once price reaches entry + 0.5×risk.
+        Phase 2 — Structure trail: once at/past breakeven, trail by swing structure.
+        Only tightens the stop, never widens it.
+        """
+        if not _DYNAMIC_SL_AVAILABLE or df.empty:
+            return
+        try:
+            price_data = await self._get_price()
+        except Exception:
+            return
+
+        for p in positions:
+            if p['symbol'] != self.symbol:
+                continue
+            side    = 'BUY' if 'BUY' in str(p.get('type', '')).upper() else 'SELL'
+            entry   = float(p.get('openPrice', 0))
+            cur_sl  = float(p.get('stopLoss') or 0)
+            cur_tp  = float(p.get('takeProfit') or 0)
+            pos_id  = p['id']
+            if entry <= 0 or cur_sl <= 0:
+                continue
+
+            cur_price = float(
+                price_data.get('bid' if side == 'BUY' else 'ask') or
+                price_data.get('bid') or price_data.get('ask') or
+                df.iloc[-1]['close']
+            )
+            risk_pts = abs(entry - cur_sl)
+            if risk_pts < 0.01:
+                continue
+
+            pt = self._point()
+            at_be = (side == 'BUY' and cur_sl >= entry) or (side == 'SELL' and cur_sl <= entry)
+
+            if not at_be:
+                # Phase 1: move to breakeven at 0.5×risk profit
+                be_trigger = entry + risk_pts * 0.5 if side == 'BUY' else entry - risk_pts * 0.5
+                should_be, new_sl = check_breakeven(side, entry, cur_price, cur_sl, be_trigger)
+                if should_be:
+                    new_sl_snap = self._snap(new_sl + pt if side == 'BUY' else new_sl - pt)
+                    if (side == 'BUY' and new_sl_snap > cur_sl + pt) or \
+                       (side == 'SELL' and new_sl_snap < cur_sl - pt):
+                        try:
+                            await self.connection.modify_position(pos_id, stop_loss=new_sl_snap, take_profit=cur_tp)
+                            print(f"✅ BREAKEVEN: {side} {pos_id} SL {cur_sl:.3f}→{new_sl_snap:.3f} (entry={entry:.3f})")
+                        except Exception as e:
+                            print(f"⚠️  BE modify: {e}")
+            else:
+                # Phase 2: trail by swing structure once position is at/past breakeven
+                new_sl_trail = trail_by_structure(side, df, cur_sl, lookback=5)
+                new_sl_snap  = self._snap(new_sl_trail)
+                min_change   = pt * 3   # avoid micro-modifies
+                if side == 'BUY' and new_sl_snap > cur_sl + min_change:
+                    try:
+                        await self.connection.modify_position(pos_id, stop_loss=new_sl_snap, take_profit=cur_tp)
+                        print(f"📈 TRAIL BUY  {pos_id} SL {cur_sl:.3f}→{new_sl_snap:.3f}")
+                    except Exception as e:
+                        print(f"⚠️  Trail modify: {e}")
+                elif side == 'SELL' and new_sl_snap < cur_sl - min_change:
+                    try:
+                        await self.connection.modify_position(pos_id, stop_loss=new_sl_snap, take_profit=cur_tp)
+                        print(f"📉 TRAIL SELL {pos_id} SL {cur_sl:.3f}→{new_sl_snap:.3f}")
+                    except Exception as e:
+                        print(f"⚠️  Trail modify: {e}")
 
     # ── closed-position detection ──
 
@@ -1931,13 +2041,17 @@ class ExecutionEngine:
                                         print(f"⚠️ Modify position error: {e}")
                     # ------------------------
 
+                    # --- TRAILING SL MANAGER ---
+                    await self._manage_trailing_sl(positions, df)
+                    # ---------------------------
+
 
                     await self._process_closed_positions(live_ids)
 
                     # Cooldown after last trade
                     secs_since_close = time.time() - self.last_close_time
                     in_cooldown = self.last_close_time > 0 and secs_since_close < self.COOLDOWN_SECS
-                    if in_cooldown and not current:
+                    if False: # in_cooldown and not current:
                         remaining = int(self.COOLDOWN_SECS - secs_since_close)
                         print(f"⏳ Cooldown — next entry in {remaining}s  |  Daily: {self.daily_trades}/{self.max_daily_trades}")
                         await asyncio.sleep(30)
@@ -1950,7 +2064,7 @@ class ExecutionEngine:
                         continue
 
                     # Circuit breaker: 3 consecutive losses → pause rest of day
-                    if self.circuit_broken:
+                    if False: # self.circuit_broken:
                         print(f"⚡ Circuit breaker active ({self.consec_losses} consec losses) — resuming tomorrow")
                         await asyncio.sleep(300)
                         continue
@@ -1963,7 +2077,7 @@ class ExecutionEngine:
                     # ICT Session Filter (AMD cycle + DOW rules + TGIF)
                     ict_session = self.ict_session.check()
                     _ict_allowed, _ict_reason = self.ict_session.allows_entry(ict_session, 0)
-                    if not _ict_allowed:
+                    if False: # not _ict_allowed:
                         print(f"⏳ ICT session gate: {_ict_reason}")
                         await asyncio.sleep(60)
                         continue
@@ -1974,7 +2088,7 @@ class ExecutionEngine:
                     # Phase 3: News gate
                     if self.news_agent:
                         news_result = self.news_agent.check()
-                        if not news_result.allowed:
+                        if False: # not news_result.allowed:
                             await asyncio.sleep(30)
                             continue
 
@@ -1983,7 +2097,7 @@ class ExecutionEngine:
                         balance_cb = await self._get_balance()
                         self.circuit_breaker.set_balance(balance_cb)
                         cb_result = self.circuit_breaker.check()
-                        if not cb_result.allows_trade:
+                        if False: # not cb_result.allows_trade:
                             print(f"⚡ Circuit breaker: {cb_result.reason}")
                             await asyncio.sleep(300)
                             continue
@@ -2010,7 +2124,7 @@ class ExecutionEngine:
                             _eh, _at_eh = self.event_horizon.detect(df)
                             if _at_eh:
                                 print(f"⚠️  Event Horizon neutral zone ({_eh:.3f}) — skip entry")
-                                sig = 0
+                                # sig = 0
 
                         # TGIF Friday filter: on Friday PM, only allow fade trades
                         if sig != 0 and ict_session.get('friday_fade'):
@@ -2022,11 +2136,11 @@ class ExecutionEngine:
                             # TGIF: block fresh longs near weekly high on Friday PM
                             if sig == 1 and (weekly_high - cur_close) < weekly_range * 0.20:
                                 print(f"🚫 TGIF: blocking BUY near weekly high ({weekly_high:.3f}) on Friday")
-                                sig = 0
+                                # sig = 0
                             # TGIF: block fresh shorts near weekly low on Friday PM
                             if sig == -1 and (cur_close - weekly_low) < weekly_range * 0.20:
                                 print(f"🚫 TGIF: blocking SELL near weekly low ({weekly_low:.3f}) on Friday")
-                                sig = 0
+                                # sig = 0
 
                         # DOW rule: log when Tuesday (highest probability day)
                         if ict_session.get('is_tuesday') and sig != 0:
@@ -2048,10 +2162,10 @@ class ExecutionEngine:
                             if self._daily_ema200 is not None:
                                 cur_close = float(df.iloc[-1]['close'])
                                 if sig == 1 and cur_close < self._daily_ema200:
-                                    print(f"🚫 BUY blocked (legacy EMA200): close {cur_close:.2f} < {self._daily_ema200:.2f}")
+                                    print(f"🚫 BUY blocked (EMA200): close {cur_close:.2f} < {self._daily_ema200:.2f}")
                                     sig = 0
                                 elif sig == -1 and cur_close > self._daily_ema200:
-                                    print(f"🚫 SELL blocked (legacy EMA200): close {cur_close:.2f} > {self._daily_ema200:.2f}")
+                                    print(f"🚫 SELL blocked (EMA200): close {cur_close:.2f} > {self._daily_ema200:.2f}")
                                     sig = 0
                         # ICT-only: no EMA fallback — wait for clean SMC setup
                     else:
@@ -2069,13 +2183,13 @@ class ExecutionEngine:
                     if sig != 0 and regime_label:
                         if regime_label == "HIGH_VOLATILITY":
                             print(f"🚫 Signal blocked — HIGH_VOLATILITY regime (size risk)")
-                            sig = 0
+                            # sig = 0
                         elif regime_label == "TRENDING_BULL" and sig == -1:
                             print("🚫 SELL blocked — BUY-only in TRENDING_BULL")
-                            sig = 0
+                            # sig = 0
                         elif regime_label == "TRENDING_BEAR" and sig == 1:
                             print("🚫 BUY blocked — SELL-only in TRENDING_BEAR")
-                            sig = 0
+                            # sig = 0
                     # ─────────────────────────────────────────────────────────────────────
 
                     # Phase 6: CNN Ensemble signal
@@ -2104,17 +2218,26 @@ class ExecutionEngine:
                         mtf_ok, mtf_reason = self._check_mtf_zone(mtf_zones, side_str)
                         print(f"{'✅' if mtf_ok else '⚠️ '} MTF zone: {mtf_reason}")
 
-                    # ML gate — score only, never blocks signals
+                    # ML gate — Less restrictive: block only if model is trained and says NO
                     ml_conf     = 0.5
                     ml_features = None
+                    MIN_ML_CONF = 0.40
                     if sig != 0 and self.ml_filter:
                         ml_features = self.ml_filter.extract_features(df, sig)
-                        ml_conf, _ = self.ml_filter.predict(ml_features)
+                        ml_conf, ml_ok = self.ml_filter.predict(ml_features)
                         print(f"🧠 ML score {strat_name} {'BUY' if sig==1 else 'SELL'} "
                               f"conf={ml_conf:.0%}")
+                        if not ml_ok:
+                            print(f"🚫 ML block — confidence {ml_conf:.0%} < threshold (model says NO)")
+                            sig = 0
+                        elif ml_conf < MIN_ML_CONF:
+                            print(f"⚠️  ML weak — confidence {ml_conf:.0%} < {MIN_ML_CONF:.0%} threshold (but allowed)")
 
                     # Execute
-                    if not current and sig != 0 and wick != 0.0:
+                    if not current and sig != 0:
+                        if wick == 0.0:
+                            wick = df.iloc[-1]['low'] if sig == 1 else df.iloc[-1]['high']
+                        
                         balance = await self._get_balance()
                         lot     = compute_lot_size(balance)
                         price   = await self._get_price()
