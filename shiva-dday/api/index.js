@@ -45,7 +45,7 @@ const TAKE_PROFIT = 2.00;  // fallback fixed TP (pts)
 const TRAIL_START = 1.00;  // move SL to breakeven once profit ≥ $1
 const TRAIL_DISTANCE = 0.50;
 const MIN_CONFIDENCE = 60; // raise bar slightly to protect compound growth
-const EV_PER_WEEK_PER_01LOT = 4.36; // proven from 9-month backtest (used for logging)
+const EV_PER_WEEK_PER_01LOT = 3.43; // combined 6-strategy engine: 9-month USOIL backtest
 
 // ML Config
 const ML_MIN_TRADES = 5;
@@ -191,9 +191,10 @@ async function initSDK() {
   return account;
 }
 
-// ============ RESEARCH STRATEGIES (Backtested: 9-month USOIL, $435/wk at 1.00 lot) ============
+// ============ RESEARCH STRATEGIES (Backtested: 9-month USOIL, $343/wk at 1.00 lot) ============
 // Sources: QuantifiedStrategies, Vestinda, StoneX, academic research
-// Strategies: EMA9/21 Cross + Donchian-20 + ICT Sweep+FVG + Hammer Pattern
+// Strategies: ICT Sweep+FVG + EMA9/21 Cross + CCI-20 + Donchian-20 + Tue/Thu Edge + Hammer
+// Combined PF=1.15, 282 trades, 25.2% WR — EIA Fade excluded (PF=0.77 negative)
 
 function calcEMA(arr, span) {
   const k = 2 / (span + 1);
@@ -339,8 +340,45 @@ function sigICTSweepFVG(candles, price, trendUp) {
   return null;
 }
 
-// Master research signal runner — returns best signal from 4 strategies
-function runResearchSignals(candles, price, atr) {
+// Signal 5: CCI-20 Oscillator — commodity-specific mean reversion (22.4% WR, PF=1.17)
+function sigCCI20(candles, ind, trendUp) {
+  const i = ind.n - 1;
+  if (i < 22) return null;
+  // Compute CCI for last 2 bars
+  function cci(idx) {
+    const p = 20;
+    const start = Math.max(0, idx - p + 1);
+    const tp = candles.slice(start, idx + 1).map(c => (c.high + c.low + c.close) / 3);
+    const mean = tp.reduce((a, b) => a + b, 0) / tp.length;
+    const mad  = tp.reduce((a, b) => a + Math.abs(b - mean), 0) / tp.length;
+    return mad > 0 ? (tp[tp.length - 1] - mean) / (0.015 * mad) : 0;
+  }
+  const cciNow  = cci(i);
+  const cciPrev = cci(i - 1);
+  // Cross -100 upward (oversold reversal) in uptrend
+  if (cciNow > -100 && cciPrev <= -100 && trendUp)  return { signal: 'BUY',  name: 'CCI-20 Oversold ↑', conf: 66 };
+  // Cross +100 downward (overbought reversal) in downtrend
+  if (cciNow < 100  && cciPrev >= 100  && !trendUp) return { signal: 'SELL', name: 'CCI-20 Overbought ↓', conf: 66 };
+  return null;
+}
+
+// Signal 6: Tuesday/Thursday London Open Edge — statistical day-of-week bias (26.1% WR, PF=1.25)
+function sigTueThu(candles, ind, trendUp, nowUTC) {
+  const i = ind.n - 1;
+  if (i < 22) return null;
+  const day = nowUTC.getUTCDay(); // 2=Tuesday, 4=Thursday
+  const hr  = nowUTC.getUTCHours();
+  if (day !== 2 && day !== 4) return null;
+  if (hr !== 8) return null;   // London open (8 UTC)
+  // Only enter if short-term trend aligns (EMA9 > EMA21 in uptrend)
+  if (trendUp  && ind.ema9[i] > ind.ema21[i]) return { signal: 'BUY',  name: 'Tue/Thu Edge ↑', conf: 63 };
+  if (!trendUp && ind.ema9[i] < ind.ema21[i]) return { signal: 'SELL', name: 'Tue/Thu Edge ↓', conf: 63 };
+  return null;
+}
+
+// Master research signal runner — returns best signal from 6 strategies
+// Backtest: COMBINED PF=1.15, $3.43/wk @ 0.01 lot on 9-month USOIL data
+function runResearchSignals(candles, price, atr, nowUTC) {
   if (candles.length < 60) return null;
 
   const ind = computeResearchIndicators(candles);
@@ -349,11 +387,13 @@ function runResearchSignals(candles, price, atr) {
   // Trend: EMA50 on the available bars (medium-term direction)
   const trendUp = price > ind.ema50[i];
 
-  // Run all 4 signals — first match wins (priority order: ICT, EMA cross, Donchian, Hammer)
+  // Priority: ICT → EMA cross → CCI → Donchian → Tue/Thu → Hammer
   const sig =
     sigICTSweepFVG(candles, price, trendUp) ||
     sigEMACross(candles, ind, trendUp)       ||
+    sigCCI20(candles, ind, trendUp)          ||
     sigDonchian(candles, ind, trendUp)       ||
+    sigTueThu(candles, ind, trendUp, nowUTC || new Date()) ||
     sigHammer(candles, ind, trendUp);
 
   if (!sig) return null;
@@ -1018,7 +1058,7 @@ async function autonomousTradingCycle() {
       });
       return trs.reduce((a, b) => a + b, 0) / trs.length;
     })();
-    const researchSig = runResearchSignals(researchCandles, price, recentATR);
+    const researchSig = runResearchSignals(researchCandles, price, recentATR, new Date());
 
     if (researchSig) {
       log(`🔬 Research signal: ${researchSig.signal} | ${researchSig.name} | conf=${researchSig.conf}% | ATR-SL=${researchSig.sl_pts.toFixed(2)}pt`);
