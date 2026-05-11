@@ -106,7 +106,7 @@ function getSignal(candles, ind, price, now) {
 
 // ── Position Management ──────────────────────────────────────────────────────
 async function managePositions(price, ind, equity) {
-    const positions = (await tradingAccount.getPositions()).filter(p => p.symbol === SYMBOL);
+    const positions = (await connection.getPositions()).filter(p => p.symbol === SYMBOL);
     let trailData = await redis.get('shiva:trail_v2') || {};
     const atr = ind.atr14[ind.n-1];
 
@@ -123,7 +123,7 @@ async function managePositions(price, ind, equity) {
         // Phase 1: Breakeven + Pyramid
         if (t.phase < 1 && profit / (pos.volume * 100) >= risk) {
             const newSL = side === 'BUY' ? pos.openPrice + 0.10 : pos.openPrice - 0.10;
-            await tradingAccount.modifyPosition(pos.id, { stopLoss: newSL });
+            await connection.modifyPosition(pos.id, { stopLoss: newSL });
             t.phase = 1;
             log(`🛡️ Breakeven for ${pos.id}`);
             if (positions.length < MAX_POSITIONS && !pos.comment.includes('PYRAMID')) {
@@ -136,7 +136,7 @@ async function managePositions(price, ind, equity) {
         if (t.phase >= 1 && profit / (pos.volume * 100) >= 2 * risk) {
             const trailSL = side === 'BUY' ? price - 0.5*atr : price + 0.5*atr;
             if ((side === 'BUY' && trailSL > pos.stopLoss) || (side === 'SELL' && trailSL < pos.stopLoss)) {
-                await tradingAccount.modifyPosition(pos.id, { stopLoss: parseFloat(trailSL.toFixed(2)) });
+                await connection.modifyPosition(pos.id, { stopLoss: parseFloat(trailSL.toFixed(2)) });
             }
         }
     }
@@ -195,8 +195,8 @@ async function openPosition(side, price, ind, equity, isPyramid = false, baseLot
     try {
         const comment = isPyramid ? 'PYRAMID' : 'SHIVA_HYPER';
         const res = side === 'BUY' 
-            ? await tradingAccount.createMarketBuyOrder(SYMBOL, finalLot, sl, tp, { comment })
-            : await tradingAccount.createMarketSellOrder(SYMBOL, finalLot, sl, tp, { comment });
+            ? await connection.createMarketBuyOrder(SYMBOL, finalLot, sl, tp, { comment })
+            : await connection.createMarketSellOrder(SYMBOL, finalLot, sl, tp, { comment });
         
         const id = res.stringCode || res.id || 'unknown';
         log(`✅ Opened ${side} ${finalLot} lots | SL: ${sl.toFixed(2)} | TP: ${tp.toFixed(2)}`);
@@ -223,7 +223,7 @@ async function openPosition(side, price, ind, equity, isPyramid = false, baseLot
 
 async function run() {
     log('Cycle started');
-    const info = await tradingAccount.getAccountInformation();
+    const info = await connection.getAccountInformation();
     const equity = info.equity;
     const balance = info.balance;
 
@@ -238,10 +238,10 @@ async function run() {
         return;
     }
 
-    const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
+    const priceData = await connection.getSymbolPrice(SYMBOL);
     const price = priceData.bid;
 
-    const history = await tradingAccount.getHistoricalCandles(SYMBOL, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
+    const history = await connection.getHistoricalCandles(SYMBOL, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
     const candles = history.map(c => ({ open: c.open, high: c.high, low: c.low, close: c.close }));
     const ind = computeIndicators(candles);
 
