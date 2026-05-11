@@ -11,7 +11,7 @@ const https = require('https');
 // Config
 const TOKEN = process.env.METAAPI_TOKEN;
 const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID;
-const SYMBOL = process.env.SYMBOL || 'USOIL';
+const SYMBOL = 'XTIUSD'; // Hardcoded for Pepperstone
 const CHECK_INTERVAL = 60000; // 1 minute cycle
 
 const RISK_PCT = 0.10;
@@ -246,13 +246,12 @@ async function run() {
         return;
     }
 
-    const symbolToUse = SYMBOL === 'USOIL' ? 'XTIUSD' : SYMBOL;
-    const priceData = await connection.getSymbolPrice(symbolToUse);
+    const priceData = await connection.getSymbolPrice(SYMBOL);
     const price = priceData.bid || priceData.ask;
-    log(`Cycle for ${symbolToUse} @ ${price.toFixed(2)}`);
+    log(`Cycle for ${SYMBOL} @ ${price.toFixed(2)}`);
 
-    // Some brokers require XTIUSD instead of USOIL for historical data
-    const history = await tradingAccount.getHistoricalCandles(symbolToUse, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
+    // Fetch 5m history
+    const history = await tradingAccount.getHistoricalCandles(SYMBOL, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
     const candles = history.map(c => ({ open: c.open, high: c.high, low: c.low, close: c.close }));
     const ind = computeIndicators(candles);
 
