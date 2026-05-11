@@ -62,7 +62,7 @@ async function init() {
             log('Deploying account...');
             await tradingAccount.deploy();
         }
-        connection = tradingAccount.getStreamingConnection();
+        connection = tradingAccount.getRPCConnection();
         await connection.connect();
         await connection.waitSynchronized();
         log('SHIVA HYPER-SCALE connected and synchronized');
