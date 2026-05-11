@@ -1,0 +1,22 @@
+{
+  "name": "shiva-trading-bot",
+  "version": "1.0.0",
+  "description": "SHIVA Live Trading Bot",
+  "main": "continuous.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node shiva_live_hyperscale.js",
+    "dev": "node shiva_live_hyperscale.js"
+  },
+  "dependencies": {
+    "metaapi.cloud-sdk": "^29.3.3",
+    "dotenv": "^17.4.2",
+    "chalk": "^5.6.2",
+    "luxon": "^3.7.2",
+    "fs-extra": "^11.3.4",
+    "@upstash/redis": "^1.37.0"
+  }
+}
