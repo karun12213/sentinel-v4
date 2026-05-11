@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "node inspect_methods.js",
+    "startCommand": "node shiva_live_hyperscale.js",
     "restartPolicyType": "ALWAYS",
     "restartPolicyMaxRetries": 999
   }

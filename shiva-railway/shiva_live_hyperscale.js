@@ -65,7 +65,6 @@ async function init() {
         connection = tradingAccount.getRPCConnection();
         await connection.connect();
         await connection.waitSynchronized();
-        log(`SHIVA HYPER-SCALE connected. Available methods: ${Object.keys(connection).filter(k => typeof connection[k] === 'function').join(', ')}`);
         log('SHIVA HYPER-SCALE connected and synchronized');
     } catch (e) {
         log(`Init failed: ${e.message}`, 'error');
@@ -190,7 +189,7 @@ async function managePositions(price, ind, equity) {
             changed = true;
         }
     }
-    if (changed || positions.length > 0) await redis.set('shiva:trail_v2', trailData);
+    if (changed || (positions.length > 0 && !Object.keys(trailData).length === 0)) await redis.set('shiva:trail_v2', trailData);
 }
 
 async function openPosition(side, price, ind, equity, isPyramid = false, baseLot = 0) {
@@ -250,7 +249,8 @@ async function run() {
     const priceData = await connection.getSymbolPrice(SYMBOL);
     const price = priceData.bid || priceData.ask;
 
-    const history = await connection.getHistoricalCandles(SYMBOL, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
+    // Correct method: getHistoricalCandles is on tradingAccount
+    const history = await tradingAccount.getHistoricalCandles(SYMBOL, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
     const candles = history.map(c => ({ open: c.open, high: c.high, low: c.low, close: c.close }));
     const ind = computeIndicators(candles);
 
