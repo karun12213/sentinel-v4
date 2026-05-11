@@ -11,7 +11,6 @@ const https = require('https');
 // Config
 const TOKEN = process.env.METAAPI_TOKEN;
 const ACCOUNT_ID = process.env.METAAPI_ACCOUNT_ID;
-const SYMBOL = 'XTIUSD'; // Hardcoded for Pepperstone
 const CHECK_INTERVAL = 60000; // 1 minute cycle
 
 const RISK_PCT = 0.10;
@@ -26,6 +25,7 @@ const redis = new Redis({
 
 const api = new MetaApi(TOKEN);
 let connection, tradingAccount;
+let ACTIVE_SYMBOL = 'USOIL';
 
 async function log(msg, type = 'info') {
     const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -65,7 +65,14 @@ async function init() {
         connection = tradingAccount.getRPCConnection();
         await connection.connect();
         await connection.waitSynchronized();
-        log('SHIVA HYPER-SCALE connected and synchronized');
+        
+        // Find correct symbol
+        const symbols = await connection.getSymbols();
+        if (symbols.includes('USOIL')) ACTIVE_SYMBOL = 'USOIL';
+        else if (symbols.includes('XTIUSD')) ACTIVE_SYMBOL = 'XTIUSD';
+        else if (symbols.includes('Oil')) ACTIVE_SYMBOL = 'Oil';
+        
+        log(`SHIVA HYPER-SCALE connected. Target Symbol: ${ACTIVE_SYMBOL}`);
     } catch (e) {
         log(`Init failed: ${e.message}`, 'error');
         process.exit(1);
@@ -132,8 +139,8 @@ function getSignal(candles, ind, price, now) {
 
 // ── Position Management ──────────────────────────────────────────────────────
 async function managePositions(price, ind, equity) {
-    const positions = (await connection.getPositions()).filter(p => p.symbol === SYMBOL);
-    let trailData = await redis.get('shiva:trail_v2') || {};
+    const positions = (await connection.getPositions()).filter(p => p.symbol === ACTIVE_SYMBOL);
+    let trailData = await redis.get('shiva:trail_v3') || {};
     const atr = ind.atr14[ind.n-1] || 0.5;
 
     for (const pos of positions) {
@@ -178,7 +185,7 @@ async function managePositions(price, ind, equity) {
             log(`Position ${id} closed. Cleaning trail data.`);
             await discordPost({
                 embeds: [{
-                    title: `🏁 POSITION CLOSED — ${SYMBOL}`,
+                    title: `🏁 POSITION CLOSED — ${ACTIVE_SYMBOL}`,
                     color: 0x888888,
                     description: `ID: \`${id}\``,
                     footer: { text: 'SHIVA HYPER-SCALE ENGINE' },
@@ -189,7 +196,7 @@ async function managePositions(price, ind, equity) {
             changed = true;
         }
     }
-    if (changed || (positions.length > 0 && !Object.keys(trailData).length === 0)) await redis.set('shiva:trail_v2', trailData);
+    if (changed || (positions.length > 0)) await redis.set('shiva:trail_v3', trailData);
 }
 
 async function openPosition(side, price, ind, equity, isPyramid = false, baseLot = 0) {
@@ -204,14 +211,14 @@ async function openPosition(side, price, ind, equity, isPyramid = false, baseLot
     try {
         const comment = isPyramid ? 'PYRAMID' : 'SHIVA_HYPER';
         const res = side === 'BUY' 
-            ? await connection.createMarketBuyOrder(SYMBOL, finalLot, sl, tp, { comment })
-            : await connection.createMarketSellOrder(SYMBOL, finalLot, sl, tp, { comment });
+            ? await connection.createMarketBuyOrder(ACTIVE_SYMBOL, finalLot, sl, tp, { comment })
+            : await connection.createMarketSellOrder(ACTIVE_SYMBOL, finalLot, sl, tp, { comment });
         
         log(`✅ Opened ${side} ${finalLot} lots | SL: ${sl.toFixed(2)} | TP: ${tp.toFixed(2)}`);
         
         await discordPost({
             embeds: [{
-                title: `${side === 'BUY' ? '🚀' : '📉'} ${side} OPENED — ${SYMBOL}`,
+                title: `${side === 'BUY' ? '🚀' : '📉'} ${side} OPENED — ${ACTIVE_SYMBOL}`,
                 color: side === 'BUY' ? 0x00FF88 : 0xFF4444,
                 fields: [
                     { name: 'Entry', value: `\`${price.toFixed(2)}\``, inline: true },
@@ -237,27 +244,27 @@ async function run() {
 
     // Daily DD Check
     const today = new Date().getUTCDate();
-    let ddState = await redis.get('shiva:dd_state') || { date: today, startBal: balance };
+    let ddState = await redis.get('shiva:dd_state_v3') || { date: today, startBal: balance };
     if (ddState.date !== today) ddState = { date: today, startBal: balance };
-    await redis.set('shiva:dd_state', ddState);
+    await redis.set('shiva:dd_state_v3', ddState);
 
     if (equity <= ddState.startBal * (1 - DAILY_DD_LIMIT)) {
         log('🛑 Daily DD Limit hit. No new trades.', 'error');
         return;
     }
 
-    const priceData = await connection.getSymbolPrice(SYMBOL);
+    const priceData = await connection.getSymbolPrice(ACTIVE_SYMBOL);
     const price = priceData.bid || priceData.ask;
-    log(`Cycle for ${SYMBOL} @ ${price.toFixed(2)}`);
+    log(`Cycle for ${ACTIVE_SYMBOL} @ ${price.toFixed(2)}`);
 
-    // Fetch 5m history
-    const history = await tradingAccount.getHistoricalCandles(SYMBOL, '5m', new Date(Date.now() - 100 * 5 * 60 * 1000), new Date());
+    // Fetch 5m history - Use 100 bars
+    const history = await tradingAccount.getHistoricalCandles(ACTIVE_SYMBOL, '5m', null, 100);
     const candles = history.map(c => ({ open: c.open, high: c.high, low: c.low, close: c.close }));
     const ind = computeIndicators(candles);
 
     await managePositions(price, ind, equity);
 
-    const positions = (await connection.getPositions()).filter(p => p.symbol === SYMBOL);
+    const positions = (await connection.getPositions()).filter(p => p.symbol === ACTIVE_SYMBOL);
     if (positions.length < MAX_POSITIONS) {
         const sig = getSignal(candles, ind, price, new Date());
         if (sig && sig.conf >= MIN_CONFIDENCE) {
