@@ -140,7 +140,47 @@ async function managePositions(price, ind, equity) {
             }
         }
     }
+    const liveIds = positions.map(p => p.id);
+    for (const id in trailData) {
+        if (!liveIds.includes(id)) {
+            log(`Position ${id} closed. Cleaning trail data.`);
+            await discordPost({
+                embeds: [{
+                    title: `🏁 POSITION CLOSED — ${SYMBOL}`,
+                    color: 0x888888,
+                    description: `ID: \`${id}\``,
+                    footer: { text: 'SHIVA HYPER-SCALE ENGINE' },
+                    timestamp: new Date().toISOString()
+                }]
+            });
+            delete trailData[id];
+        }
+    }
     await redis.set('shiva:trail_v2', trailData);
+}
+
+const https = require('https');
+
+async function discordPost(payload) {
+    const webhook = process.env.DISCORD_TRADES || process.env.DISCORD_ALERTS;
+    if (!webhook) return;
+    const data = JSON.stringify(payload);
+    const url = new URL(webhook);
+    const options = {
+        hostname: url.hostname,
+        path: url.pathname,
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': data.length,
+        },
+    };
+    return new Promise((resolve) => {
+        const req = https.request(options, (res) => resolve());
+        req.on('error', (e) => console.error(`Discord error: ${e.message}`));
+        req.write(data);
+        req.end();
+    });
 }
 
 async function openPosition(side, price, ind, equity, isPyramid = false, baseLot = 0) {
@@ -157,7 +197,25 @@ async function openPosition(side, price, ind, equity, isPyramid = false, baseLot
         const res = side === 'BUY' 
             ? await tradingAccount.createMarketBuyOrder(SYMBOL, finalLot, sl, tp, { comment })
             : await tradingAccount.createMarketSellOrder(SYMBOL, finalLot, sl, tp, { comment });
+        
+        const id = res.stringCode || res.id || 'unknown';
         log(`✅ Opened ${side} ${finalLot} lots | SL: ${sl.toFixed(2)} | TP: ${tp.toFixed(2)}`);
+        
+        await discordPost({
+            embeds: [{
+                title: `${side === 'BUY' ? '🚀' : '📉'} ${side} OPENED — ${SYMBOL}`,
+                color: side === 'BUY' ? 0x00FF88 : 0xFF4444,
+                fields: [
+                    { name: 'Entry', value: `\`${price.toFixed(2)}\``, inline: true },
+                    { name: 'SL', value: `\`${sl.toFixed(2)}\``, inline: true },
+                    { name: 'TP', value: `\`${tp.toFixed(2)}\``, inline: true },
+                    { name: 'Lot', value: `\`${finalLot.toFixed(2)}\``, inline: true },
+                    { name: 'Type', value: isPyramid ? '`PYRAMID`' : '`BASE`', inline: true }
+                ],
+                footer: { text: 'SHIVA HYPER-SCALE ENGINE' },
+                timestamp: new Date().toISOString()
+            }]
+        });
     } catch (e) {
         log(`Open error: ${e.message}`, 'error');
     }
