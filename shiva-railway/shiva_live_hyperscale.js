@@ -65,6 +65,7 @@ async function init() {
         connection = tradingAccount.getRPCConnection();
         await connection.connect();
         await connection.waitSynchronized();
+        log(`SHIVA HYPER-SCALE connected. Available methods: ${Object.keys(connection).filter(k => typeof connection[k] === 'function').join(', ')}`);
         log('SHIVA HYPER-SCALE connected and synchronized');
     } catch (e) {
         log(`Init failed: ${e.message}`, 'error');
