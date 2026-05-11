@@ -4,8 +4,8 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python3 live_core.py",
+    "startCommand": "node shiva_live_hyperscale.js",
     "restartPolicyType": "ALWAYS",
-    "restartPolicyMaxRetries": 999999
+    "restartPolicyMaxRetries": 999
   }
 }
