@@ -362,12 +362,13 @@ function sig8_orb(I, ind) {
     return null;
 }
 
-const ALL_SIG_FNS = [sig1_emaCross, sig2_donchian, sig3_ict, sig4_candle,
-                     sig5_rsi2, sig6_squeeze, sig7_vwap, sig8_orb];
+// ── ACTIVE SIGNALS: S1 + S7 only (proven winners from 9-month backtest)
+// S1: PF 1.51, +$183 | S7: PF 1.09, +$102 | All others are net losers
+const ACTIVE_SIG_FNS = [sig1_emaCross, sig7_vwap, sig5_rsi2];
 
 function getAllSignals(ind) {
     const i = ind.n - 1;
-    return ALL_SIG_FNS.map(fn => {
+    return ACTIVE_SIG_FNS.map(fn => {
         try { return fn(i, ind); } catch (e) { return null; }
     }).filter(s => s !== null);
 }
@@ -380,22 +381,23 @@ function getEnsembleSignal(ind) {
     const buys  = signals.filter(s => s.side === 'BUY');
     const sells = signals.filter(s => s.side === 'SELL');
 
+    // Require at least 1 of S1 or S7 to fire (no RSI2-only trades)
+    const s1 = signals.find(s => s.name && s.name.includes('S1'));
+    const s7 = signals.find(s => s.name && s.name.includes('S7'));
+    if (!s1 && !s7) return null;
+
     let chosen = null;
-    let lotMultiplier = 0.5;  // 1 signal → half lot
+    let lotMultiplier = 1.0;
 
     if (buys.length >= 2) {
-        chosen = buys[0];
-        lotMultiplier = 1.0;  // 2+ agree → full lot
+        chosen = buys[0]; lotMultiplier = 1.0;   // 2+ agree → full lot
     } else if (sells.length >= 2) {
-        chosen = sells[0];
-        lotMultiplier = 1.0;
-    } else if (signals.length >= 1) {
-        // Single signal — half lot, only trade most confident ones
-        chosen = signals[0];
-        lotMultiplier = 0.5;
+        chosen = sells[0]; lotMultiplier = 1.0;
+    } else if (s1 || s7) {
+        chosen = s1 || s7; lotMultiplier = 0.75; // single quality signal → 75% lot
     }
 
-    return chosen ? { ...chosen, lotMultiplier, allSignals: signals } : null;
+    return chosen ? { ...chosen, lotMultiplier, signalCount: signals.length } : null;
 }
 
 // ── 3-Phase Trailing SL ───────────────────────────────────────────────────────
@@ -513,18 +515,19 @@ async function managePositions(price, ind, equity) {
 async function openPosition(side, price, ind, equity, isPyramid = false, baseLot = 0) {
     const atr = ind.atr14[ind.n - 1] || 0.5;
 
-    // Auto-compound lot sizing: equity * 1% / ATR / 1000
+    // Auto-compound lot: 10% risk, SL=1.5xATR, TP=3.0xATR (backtest-optimised)
+    const slPts = Math.max(0.30, atr * 1.5);
+    const tpPts = slPts * 2.0;   // 3.0x ATR = 2.0x SL distance → 1:2 RR
     let lot;
     if (isPyramid) {
         lot = baseLot * 0.5;
     } else {
-        lot = equity * 0.01 / (atr * 1000);
+        lot = (equity * 0.10) / (slPts * 1000);  // 10% equity risk per trade
     }
     lot = Math.max(0.01, Math.min(5.0, parseFloat(lot.toFixed(2))));
 
-    const slPts = Math.max(0.15, atr * 1.5);
     const sl = parseFloat((side === 'BUY' ? price - slPts : price + slPts).toFixed(2));
-    const tp = parseFloat((side === 'BUY' ? price + slPts * 2.5 : price - slPts * 2.5).toFixed(2));
+    const tp = parseFloat((side === 'BUY' ? price + tpPts : price - tpPts).toFixed(2));
 
     try {
         const comment = isPyramid ? 'SHIVA_PYRAMID' : 'SHIVA_ICT';
