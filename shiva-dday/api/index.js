@@ -3,6 +3,7 @@
 
 const MetaApi = require('metaapi.cloud-sdk').default;
 const { Redis } = require('@upstash/redis');
+const newsTrader = require('./news_trader');
 
 // Upstash Redis for persistent state
 const redis = new Redis({
@@ -1131,6 +1132,35 @@ async function autonomousTradingCycle() {
       await pushBotLog(`Daily Drawdown Limit Reached - Halting entries`, 'error', '🛑');
       dailyDDHit = true;
     }
+
+    // ── NEWS TRADER (EIA Wednesday 14:30 UTC / NFP 1st Friday 12:30 UTC) ───────
+    // Runs before normal signal logic. If a news event is active AND the
+    // release candle is large enough, opens a news trade and returns early
+    // so the normal cycle doesn't fire at the same time.
+    if (!dailyDDHit) {
+      try {
+        const newsResult = await newsTrader.run(
+          tradingAccount, SYMBOL, equity, redis,
+          (msg, t) => { log(`[NEWS] ${msg}`, t); pushBotLog(`[NEWS] ${msg}`, t); }
+        );
+        if (newsResult) {
+          // A news trade was successfully opened — skip normal cycle this tick
+          log(`[NEWS] Trade opened for ${newsResult.event}: ${newsResult.side} lot=${newsResult.lot}`, 'success');
+          return {
+            success: true,
+            signal: newsResult.side,
+            confidence: 100,
+            cycle: cycleCount,
+            positions_opened: 1,
+            source: 'NEWS_TRADER',
+            event: newsResult.event
+          };
+        }
+      } catch (newsErr) {
+        log(`[NEWS] Error (non-fatal): ${newsErr.message}`, 'error');
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Get price
     const priceData = await tradingAccount.getSymbolPrice(SYMBOL);
