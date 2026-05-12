@@ -16,7 +16,7 @@ const CHECK_INTERVAL = 60000; // 1 minute cycle
 const RISK_PCT = 0.10;
 const MAX_POSITIONS = 2; 
 const DAILY_DD_LIMIT = 0.25;
-const MIN_CONFIDENCE = 65;
+const MIN_CONFIDENCE = 10;
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL || '',
@@ -123,10 +123,7 @@ function getSignal(candles, ind, price, now) {
     if (i < 20) return null;
     const hr = now.getUTCHours();
 
-    // Session filter: London (7-12) or NY (13-17)
-    if (!((hr >= 7 && hr <= 12) || (hr >= 13 && hr <= 17))) return null;
-
-    // ORB Breakout (Simplified)
+    // ORB Breakout (NY open hour)
     if (hr === 13 && price > ind.don10Hi[i-1]) return { signal: 'BUY', name: 'ORB ↑', conf: 72 };
     if (hr === 13 && price < ind.don10Lo[i-1]) return { signal: 'SELL', name: 'ORB ↓', conf: 72 };
 
@@ -287,3 +284,4 @@ async function start() {
 }
 
 start();
+();
