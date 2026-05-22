@@ -223,18 +223,28 @@ def require_env(name):
 def compute_lot_size(capital: float,
                      step: float = 100.0,
                      base_lot: float = 0.01,
-                     max_lot: float = 0.01) -> float:
+                     max_lot: float = 5.0) -> float:
     """
-    FIXED LOT SIZE — Use environment variable or default to 0.01.
-    Targets $400/week by capturing moves (1:2.5 RR).
+    Compound lot sizing: 0.01 lot per $100 of capital.
+      $100  → 0.01 lot  (win ~$X, loss ~$Y at 1:3 RR)
+      $500  → 0.05 lot
+      $1000 → 0.10 lot
+      $10k  → 1.00 lot
+      $50k+ → 5.00 lot (max)
+
+    Override: set LOT_SIZE env var for fixed lot (testing/recovery).
     """
     env_lot = os.getenv("LOT_SIZE")
     if env_lot:
         try:
-            return float(env_lot)
+            fixed = float(env_lot)
+            if fixed > 0:
+                return fixed
         except ValueError:
             pass
-    return 0.05
+    # Dynamic compound: floor(capital / $100) × 0.01, capped at max_lot
+    tiers = max(1, int(capital / step))
+    return min(tiers * base_lot, max_lot)
 
 
 # ─────────────────────────────────────────────
@@ -1714,9 +1724,18 @@ class ExecutionEngine:
         return float(scaled.to_integral_value(rounding=rmap[direction]) * pt)
 
     def _build_levels(self, side: str, entry: float, wick: float):
-        """Structure-aware SL/TP — 1:3 RR matching 9-month validated backtest params."""
-        sl_dist = 0.50   # $5 risk per trade on 0.01 lot — wide enough to avoid noise (≥1×ATR)
-        tp_dist = 1.50   # $15 reward — 1:3 RR, breakeven WR = 25% (actual WR = 30-50%)
+        """ATR-based SL/TP — 1:3 RR, breakeven WR = 25% (actual WR = 30-50%)."""
+        # Read ATR from last candle if available, else fallback to fixed 0.50
+        atr_live = getattr(self, '_last_atr', 0.50) or 0.50
+        sl_pts   = float(os.getenv('SL_POINTS', '0.0')) or 0.0
+        tp_mult  = float(os.getenv('TP_MULT', '3.0'))
+
+        # Use ATR-based SL if no override, with 0.30 minimum
+        if sl_pts <= 0:
+            sl_dist = max(0.30, atr_live * 1.0)
+        else:
+            sl_dist = sl_pts
+        tp_dist = sl_dist * tp_mult
 
         if side == 'BUY':
             sl = entry - sl_dist
@@ -2001,6 +2020,7 @@ class ExecutionEngine:
             # Initial daily EMA200 fetch (legacy macro filter)
             await self._update_daily_ema200()
 
+            _consec_errors = 0
             while self.is_running:
                 try:
                     self._check_daily_reset()
@@ -2015,6 +2035,8 @@ class ExecutionEngine:
                     _dbg_rsi   = float(r.get('RSI', 0)   or 0)
                     _dbg_atr   = float(r.get('ATR', 0)   or 0)
                     _dbg_adx   = float(r.get('ADX_14', 0) or 0)
+                    # Store live ATR for _build_levels dynamic SL sizing
+                    self._last_atr = _dbg_atr if _dbg_atr > 0 else 0.50
                     print(f"🔄 Loop | close={_dbg_close:.3f}  RSI={_dbg_rsi:.1f}  ATR={_dbg_atr:.3f}  ADX={_dbg_adx:.1f}  trades={self.daily_trades}")
 
                     # Multi-timeframe discount/premium zone map (cached 15 min)
@@ -2092,13 +2114,13 @@ class ExecutionEngine:
                             await asyncio.sleep(30)
                             continue
 
-                    # Phase 9: Circuit Breaker gate (replaces ad-hoc logic below)
+                    # Phase 9: Circuit Breaker gate — ENABLED (protects compound capital)
                     if self.circuit_breaker:
                         balance_cb = await self._get_balance()
                         self.circuit_breaker.set_balance(balance_cb)
                         cb_result = self.circuit_breaker.check()
-                        if False: # not cb_result.allows_trade:
-                            print(f"⚡ Circuit breaker: {cb_result.reason}")
+                        if not cb_result.allows_trade:
+                            print(f"⚡ Circuit breaker ACTIVE: {cb_result.reason} — pausing 5 min")
                             await asyncio.sleep(300)
                             continue
 
@@ -2321,11 +2343,16 @@ class ExecutionEngine:
                             )
                             print(f"  Daily trades: {self.daily_trades}/{self.max_daily_trades}  |  Lot tier: {lot} (bal=${balance:.0f})")
 
-                    await asyncio.sleep(30)  # check every 30s (5m candles)
+                    _consec_errors = 0  # reset on successful loop iteration
+                    await asyncio.sleep(30)  # check every 30s
 
                 except Exception as e:
+                    _consec_errors += 1
                     msg = str(e)
-                    print(f"⚠️  Loop warning: {msg[:200]}")
+                    print(f"⚠️  Loop error #{_consec_errors}: {msg[:200]}")
+                    if _consec_errors >= 5:
+                        print("💥 5 consecutive errors — forcing reconnect")
+                        raise RuntimeError(f"Too many consecutive errors: {msg[:100]}")
                     if 'cpu credits' in msg or '429' in msg or 'rate' in msg.lower():
                         print("🚦 Rate limited — backing off 10 min")
                         await asyncio.sleep(600)
@@ -2367,6 +2394,8 @@ if __name__ == "__main__":
     _bootstrap_analytics = AnalyticsEngine()
     start_health_server(_bootstrap_analytics)
 
+    _restart_delay = 30
+    _max_delay     = 300
     while True:
         engine = None
         try:
@@ -2378,7 +2407,12 @@ if __name__ == "__main__":
             if not engine.is_running:
                 print("🛑 Clean shutdown")
                 break
+            _restart_delay = 30  # reset on successful run
+        except KeyboardInterrupt:
+            print("🛑 KeyboardInterrupt — exiting")
+            break
         except Exception as e:
-            print(f"❌ Main loop error: {e}")
-            print("⏳ Restarting in 30 s…")
-            time.sleep(30)
+            print(f"❌ Fatal error: {e}")
+            print(f"⏳ Restarting in {_restart_delay}s…")
+            time.sleep(_restart_delay)
+            _restart_delay = min(_restart_delay * 2, _max_delay)

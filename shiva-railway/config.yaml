@@ -28,11 +28,11 @@ dynamic_sl:
 
 # ── Phase 9: Circuit Breaker ─────────────────────────────────────────────
 circuit_breaker:
-  max_daily_losses: 2
-  max_daily_drawdown_pct: 5.0
-  max_daily_trades: 19     # User requested 19
-  wr_alert_threshold: 0.45
-  size_reduction_on_alert: 0.50
+  max_daily_losses: 6           # stop after 6 losses in a day
+  max_daily_drawdown_pct: 20.0  # stop if daily drawdown > 20% of balance
+  max_daily_trades: 20          # hard daily cap
+  wr_alert_threshold: 0.15      # alert if rolling WR drops below 15%
+  size_reduction_on_alert: 0.5  # halve lot size on WR alert
 
 
 # ── Phase 10: Walk-Forward Backtesting ────────────────────────────────────
